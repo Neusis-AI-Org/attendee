@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: attendee
+  labels:
+    app: attendee
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: attendee-webpage-streamer
+  labels:
+    app: attendee-webpage-streamer

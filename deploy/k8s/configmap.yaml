@@ -1,0 +1,53 @@
+# Non-secret environment variables
+# Secret values go in secret.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: env
+  namespace: attendee
+data:
+  # Django
+  DJANGO_SETTINGS_MODULE: "attendee.settings.production-gke"
+  ALLOWED_HOSTS: "*"
+
+  # Storage — native GCS backend via Workload Identity
+  STORAGE_PROTOCOL: "gcs"
+  AWS_RECORDING_STORAGE_BUCKET_NAME: "attendee-recordings-neusis-platform"
+  GCS_PROJECT_ID: "neusis-platform"
+
+  # Bot pods
+  BOT_POD_NAMESPACE: "attendee"
+  WEBPAGE_STREAMER_POD_NAMESPACE: "attendee-webpage-streamer"
+  BOT_POD_IMAGE: "us-central1-docker.pkg.dev/neusis-platform/attendee/attendee"
+  BOT_POD_CONFIG_MAP_NAME: "env"
+  BOT_POD_SECRETS_NAME: "app-secrets"
+  BOT_POD_SERVICE_ACCOUNT_NAME: "attendee-bot"
+  DISABLE_BOT_POD_IMAGE_PULL_SECRET: "true"
+  IS_A_BOT_POD: "false"
+
+  # Bot resource defaults
+  BOT_CPU_REQUEST: "4"
+  BOT_MEMORY_REQUEST: "4Gi"
+  BOT_MEMORY_LIMIT: "4Gi"
+  BOT_EPHEMERAL_STORAGE_REQUEST: "10Gi"
+
+  # Redis — Memorystore uses private network, no SSL needed
+  # Do NOT set DISABLE_REDIS_SSL here; it adds ssl params that conflict with redis:// scheme
+
+  # Disable secure cookies until SSL is configured
+  SESSION_COOKIE_SECURE: "false"
+  CSRF_COOKIE_SECURE: "false"
+
+  # Use console email backend (no SMTP configured yet)
+  EMAIL_BACKEND: "django.core.mail.backends.console.EmailBackend"
+
+  # Webhooks
+  REQUIRE_HTTPS_WEBHOOKS: "false"
+
+  # Logging
+  ATTENDEE_LOG_LEVEL: "INFO"
+  ATTENDEE_LOG_FORMAT: "json"
+
+  # Domain — update these when you have a domain, for now allow all
+  SITE_DOMAIN: "*"
+  CSRF_TRUSTED_ORIGINS: "http://*,https://*"

@@ -69,7 +69,7 @@ def download_blob_from_remote_storage(url: str, max_retries: int) -> memoryview:
 
 
 def remote_storage_url(file_field):
-    if settings.STORAGE_PROTOCOL == "azure":
+    if settings.STORAGE_PROTOCOL in ("azure", "gcs"):
         return file_field.url
 
     # Generate a temporary signed URL that expires in 30 minutes (1800 seconds)

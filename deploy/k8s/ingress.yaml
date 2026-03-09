@@ -1,0 +1,28 @@
+# GKE Ingress — works with IP only, no domain required
+# To add a domain + SSL later, uncomment the ManagedCertificate and annotations below
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: attendee-ingress
+  namespace: attendee
+  annotations:
+    kubernetes.io/ingress.global-static-ip-name: attendee-ip
+    kubernetes.io/ingress.class: "gce"
+    # Uncomment when you have a domain:
+    # networking.gke.io/managed-certificates: attendee-cert
+spec:
+  defaultBackend:
+    service:
+      name: attendee-web
+      port:
+        number: 80
+# ---
+# # Uncomment when you have a domain and want auto-provisioned SSL:
+# apiVersion: networking.gke.io/v1
+# kind: ManagedCertificate
+# metadata:
+#   name: attendee-cert
+#   namespace: attendee
+# spec:
+#   domains:
+#     - app.neusis.com

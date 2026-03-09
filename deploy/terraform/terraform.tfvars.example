@@ -1,0 +1,14 @@
+project_id   = "neusis-platform"
+region       = "us-central1"
+environment  = "production"
+domain       = ""  # Optional — set when you have a domain (e.g. "app.neusis.com")
+
+# Cloud SQL
+db_tier      = "db-custom-2-8192"
+db_disk_size = 20
+
+# Memorystore
+redis_memory_size_gb = 2
+
+# GCS (leave empty to auto-generate name)
+recording_bucket_name = ""

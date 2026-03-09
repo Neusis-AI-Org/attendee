@@ -191,8 +191,11 @@ class CalendarSyncHandler:
             dict: Summary of sync results
         """
         try:
-            # Step 0: Refresh notification channels
-            self._refresh_notification_channels()
+            # Step 0: Refresh notification channels (non-fatal — polling still works)
+            try:
+                self._refresh_notification_channels()
+            except Exception as e:
+                logger.warning("Calendar %s: Failed to refresh notification channels, continuing with poll-based sync: %s", self.calendar.object_id, e)
 
             # Step 1: Set time window
             now = timezone.now()
@@ -578,10 +581,24 @@ class MicrosoftCalendarSyncHandler(CalendarSyncHandler):
       credentials with the new refresh_token when present.
     """
 
-    TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+    DEFAULT_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
     GRAPH_BASE = "https://graph.microsoft.com/v1.0"
     CALENDAR_EVENT_SELECT_FIELDS = "id,subject,start,end,attendees,organizer,iCalUId,seriesMasterId,isCancelled,isOnlineMeeting,onlineMeetingProvider,onlineMeeting,onlineMeetingUrl,location,body,webLink"
     NOTIFICATION_CHANNEL_EXPIRATION_TIME_MINUTES = 10070 - 1
+
+    @property
+    def _token_url(self):
+        """Build the token URL, using tenant_id from metadata or credentials if available."""
+        tenant_id = None
+        if self.calendar.metadata and isinstance(self.calendar.metadata, dict):
+            tenant_id = self.calendar.metadata.get("tenant_id")
+        if not tenant_id:
+            credentials = self.calendar.get_credentials()
+            if credentials:
+                tenant_id = credentials.get("tenant_id")
+        if tenant_id:
+            return f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+        return self.DEFAULT_TOKEN_URL
 
     def _refresh_notification_channels(self):
         # For microsoft calendars, we only need one notification channel. We can keep updating it to increase the expiration time.
@@ -696,7 +713,7 @@ class MicrosoftCalendarSyncHandler(CalendarSyncHandler):
         }
 
         try:
-            response = requests.post(self.TOKEN_URL, data=data, timeout=30)
+            response = requests.post(self._token_url, data=data, timeout=30)
             response.raise_for_status()
             token_data = response.json()
 

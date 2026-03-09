@@ -66,6 +66,7 @@ from .audio_chunk_uploader import AudioChunkUploader
 from .audio_output_manager import AudioOutputManager
 from .azure_file_uploader import AzureFileUploader
 from .bot_resource_snapshot_taker import BotResourceSnapshotTaker
+from .gcs_file_uploader import GCSFileUploader
 from .closed_caption_manager import ClosedCaptionManager
 from .grouped_closed_caption_manager import GroupedClosedCaptionManager
 from .gstreamer_pipeline import GstreamerPipeline
@@ -526,6 +527,12 @@ class BotController:
                 connection_string=settings.RECORDING_STORAGE_BACKEND.get("OPTIONS").get("connection_string"),
                 account_key=settings.RECORDING_STORAGE_BACKEND.get("OPTIONS").get("account_key"),
                 account_name=settings.RECORDING_STORAGE_BACKEND.get("OPTIONS").get("account_name"),
+            )
+
+        if settings.STORAGE_PROTOCOL == "gcs":
+            return GCSFileUploader(
+                bucket=settings.AWS_RECORDING_STORAGE_BUCKET_NAME,
+                filename=self.get_recording_filename(),
             )
 
         return S3FileUploader(

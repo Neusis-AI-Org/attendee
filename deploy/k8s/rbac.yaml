@@ -1,0 +1,58 @@
+# Allow the app service account to manage bot pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: bot-pod-manager
+  namespace: attendee
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "delete", "get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bot-pod-manager-binding
+  namespace: attendee
+subjects:
+  - kind: ServiceAccount
+    name: attendee-app
+    namespace: attendee
+roleRef:
+  kind: Role
+  name: bot-pod-manager
+  apiGroup: rbac.authorization.k8s.io
+---
+# Allow app to manage webpage streamer pods + services in the streamer namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: webpage-streamer-manager
+  namespace: attendee-webpage-streamer
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "delete", "get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: webpage-streamer-manager-binding
+  namespace: attendee-webpage-streamer
+subjects:
+  - kind: ServiceAccount
+    name: attendee-app
+    namespace: attendee
+roleRef:
+  kind: Role
+  name: webpage-streamer-manager
+  apiGroup: rbac.authorization.k8s.io

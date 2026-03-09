@@ -2096,7 +2096,7 @@ class Recording(models.Model):
         if not self.file.name:
             return None
 
-        if settings.STORAGE_PROTOCOL == "azure":
+        if settings.STORAGE_PROTOCOL in ("azure", "gcs"):
             return self.file.url
 
         # Generate a temporary signed URL that expires in 30 minutes (1800 seconds)
@@ -2824,7 +2824,7 @@ class BotDebugScreenshot(models.Model):
         if not self.file.name:
             return None
 
-        if settings.STORAGE_PROTOCOL == "azure":
+        if settings.STORAGE_PROTOCOL in ("azure", "gcs"):
             return self.file.url
 
         # Generate a temporary signed URL that expires in 30 minutes (1800 seconds)

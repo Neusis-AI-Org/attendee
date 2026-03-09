@@ -99,3 +99,15 @@ db.sqlite3
 
 custom/
 docker-compose.yaml
+
+### Secrets / credentials ###
+deploy/k8s/secret.yaml
+get_ms_token.py
+
+### Terraform ###
+deploy/terraform/.terraform/
+deploy/terraform/terraform.tfstate
+deploy/terraform/terraform.tfstate.backup
+deploy/terraform/tfplan
+deploy/terraform/*.tfvars
+!deploy/terraform/*.tfvars.example

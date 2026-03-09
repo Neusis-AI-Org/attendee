@@ -1,0 +1,149 @@
+# ── Web (Gunicorn) ───────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: attendee-web
+  namespace: attendee
+  labels:
+    app: attendee
+    component: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: attendee
+      component: web
+  template:
+    metadata:
+      labels:
+        app: attendee
+        component: web
+    spec:
+      serviceAccountName: attendee-app
+      containers:
+        - name: web
+          image: REGION-docker.pkg.dev/PROJECT_ID/attendee/attendee:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              python manage.py collectstatic --noinput &&
+              python manage.py migrate --noinput &&
+              gunicorn attendee.wsgi --bind=0.0.0.0:8000 --workers=4 --timeout=120 --access-logfile=-
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: env
+            - secretRef:
+                name: app-secrets
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /health/
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          startupProbe:
+            httpGet:
+              path: /health/
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 5
+---
+# ── Celery Worker ────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: attendee-worker
+  namespace: attendee
+  labels:
+    app: attendee
+    component: worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: attendee
+      component: worker
+  template:
+    metadata:
+      labels:
+        app: attendee
+        component: worker
+    spec:
+      serviceAccountName: attendee-app
+      containers:
+        - name: worker
+          image: REGION-docker.pkg.dev/PROJECT_ID/attendee/attendee:latest
+          args:
+            - celery
+            - -A
+            - attendee
+            - worker
+            - -l
+            - INFO
+            - --concurrency=4
+          envFrom:
+            - configMapRef:
+                name: env
+            - secretRef:
+                name: app-secrets
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              memory: "2Gi"
+---
+# ── Scheduler ────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: attendee-scheduler
+  namespace: attendee
+  labels:
+    app: attendee
+    component: scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: attendee
+      component: scheduler
+  template:
+    metadata:
+      labels:
+        app: attendee
+        component: scheduler
+    spec:
+      serviceAccountName: attendee-app
+      containers:
+        - name: scheduler
+          image: REGION-docker.pkg.dev/PROJECT_ID/attendee/attendee:latest
+          args: ["python", "manage.py", "run_scheduler"]
+          envFrom:
+            - configMapRef:
+                name: env
+            - secretRef:
+                name: app-secrets
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+              ephemeral-storage: "512Mi"
+            limits:
+              memory: "512Mi"
