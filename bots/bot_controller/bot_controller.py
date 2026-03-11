@@ -599,14 +599,32 @@ class BotController:
         if self.get_recording_file_location():
             self.upload_recording_to_external_media_storage_if_enabled()
 
-            logger.info("Telling file uploader to upload recording file...")
-            file_uploader = self.get_file_uploader()
-            file_uploader.upload_file(self.get_recording_file_location())
-            file_uploader.wait_for_upload()
-            logger.info("File uploader finished uploading file")
-            file_uploader.delete_file(self.get_recording_file_location())
-            logger.info("File uploader deleted file from local filesystem")
-            self.recording_file_saved(file_uploader.filename)
+            recording_upload_url = os.getenv("RECORDING_UPLOAD_URL")
+            if recording_upload_url:
+                logger.info(f"Uploading recording via HTTP POST to {recording_upload_url}")
+                from bots.bot_controller.http_file_uploader import HTTPFileUploader
+
+                http_uploader = HTTPFileUploader(
+                    upload_url=recording_upload_url,
+                    filename=self.get_recording_filename(),
+                    bot_id=self.bot_in_db.id,
+                    bot_object_id=self.bot_in_db.object_id,
+                    meeting_url=self.bot_in_db.meeting_url,
+                )
+                http_uploader.upload_file(self.get_recording_file_location())
+                http_uploader.wait_for_upload()
+                logger.info("HTTP file upload finished")
+                http_uploader.delete_file(self.get_recording_file_location())
+                logger.info("File uploader deleted file from local filesystem")
+            else:
+                logger.info("Telling file uploader to upload recording file...")
+                file_uploader = self.get_file_uploader()
+                file_uploader.upload_file(self.get_recording_file_location())
+                file_uploader.wait_for_upload()
+                logger.info("File uploader finished uploading file")
+                file_uploader.delete_file(self.get_recording_file_location())
+                logger.info("File uploader deleted file from local filesystem")
+                self.recording_file_saved(file_uploader.filename)
 
         if self.bot_in_db.create_debug_recording():
             self.save_debug_recording()

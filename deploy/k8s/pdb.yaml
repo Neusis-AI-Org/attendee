@@ -1,0 +1,14 @@
+# PodDisruptionBudget for Celery workers
+# Prevents GKE Autopilot from evicting worker pods during node scale-down
+# while bots are running (bots run as long-lived Celery tasks inside workers)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: attendee-worker-pdb
+  namespace: attendee
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: attendee
+      component: worker

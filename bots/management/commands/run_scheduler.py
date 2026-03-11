@@ -86,6 +86,7 @@ class Command(BaseCommand):
                 self._run_periodic_zoom_oauth_connection_syncs()
                 self._run_periodic_zoom_oauth_connection_token_refreshs()
                 self._run_autopay_tasks()
+                self._clean_up_stale_bots()
             except Exception:
                 log.exception("Scheduler cycle failed")
             finally:
@@ -291,3 +292,14 @@ class Command(BaseCommand):
             enqueue_autopay_charge_task(organization)
 
         log.info("Enqueued %d autopay tasks", len(organizations))
+
+    def _clean_up_stale_bots(self):
+        """
+        Clean up bots that have timed out or never launched.
+        Runs the built-in cleanup command every scheduler cycle.
+        """
+        try:
+            from django.core.management import call_command
+            call_command("clean_up_bots_with_heartbeat_timeout_or_that_never_launched")
+        except Exception:
+            log.exception("Failed to clean up stale bots")

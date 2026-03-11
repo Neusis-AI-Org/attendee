@@ -358,7 +358,7 @@ class BotPodCreator:
                 service_account_name=os.getenv("BOT_POD_SERVICE_ACCOUNT_NAME", "default"),
                 restart_policy="Never",
                 image_pull_secrets=self.get_pod_image_pull_secrets(),
-                termination_grace_period_seconds=60,
+                termination_grace_period_seconds=300,
                 tolerations= self.get_pod_tolerations(),
                 volumes=self.get_bot_pod_volumes(),
             )
@@ -385,7 +385,7 @@ class BotPodCreator:
                     service_account_name=os.getenv("WEBPAGE_STREAMER_POD_SERVICE_ACCOUNT_NAME", "default"),
                     restart_policy="Never",
                     image_pull_secrets=self.get_pod_image_pull_secrets(),
-                    termination_grace_period_seconds=60,
+                    termination_grace_period_seconds=300,
                     tolerations=self.get_pod_tolerations(),
                     volumes=self.get_webpage_streamer_volumes(),
                 )

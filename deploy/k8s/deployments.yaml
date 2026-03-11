@@ -85,6 +85,7 @@ spec:
         component: worker
     spec:
       serviceAccountName: attendee-app
+      terminationGracePeriodSeconds: 300
       containers:
         - name: worker
           image: REGION-docker.pkg.dev/PROJECT_ID/attendee/attendee:latest
@@ -104,10 +105,10 @@ spec:
           resources:
             requests:
               cpu: "1"
-              memory: "2Gi"
+              memory: "4Gi"
               ephemeral-storage: "1Gi"
             limits:
-              memory: "2Gi"
+              memory: "4Gi"
 ---
 # ── Scheduler ────────────────────────────────────────────────────────────────
 apiVersion: apps/v1
