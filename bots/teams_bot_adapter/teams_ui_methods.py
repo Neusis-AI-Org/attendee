@@ -129,7 +129,16 @@ class TeamsUIMethods:
 
             return
 
-        logger.info("Failed to enable closed captions programatically. Waiting for the Language and Speech button...")
+        logger.info("Failed to enable closed captions programatically. Trying UI approach...")
+
+        # Try clicking the show more button first to reveal the captions menu
+        try:
+            show_more_button = WebDriverWait(self.driver, 4).until(EC.presence_of_element_located((By.ID, "callingButtons-showMoreBtn")))
+            logger.info("Clicking the show more button...")
+            self.click_element(show_more_button, "click_show_more_button")
+        except Exception:
+            logger.info("Show more button not found, proceeding to look for captions buttons directly")
+
         try:
             language_and_speech_button = self.locate_element(step="language_and_speech_button", condition=EC.presence_of_element_located((By.ID, "LanguageSpeechMenuControl-id")), wait_time_seconds=4)
             logger.info("Clicking the language and speech button...")
@@ -164,27 +173,30 @@ class TeamsUIMethods:
             logger.info("Waiting room timeout exceeded. Raising UiCouldNotJoinMeetingWaitingRoomTimeoutException")
             raise UiCouldNotJoinMeetingWaitingRoomTimeoutException("Waiting room timeout exceeded", step)
 
-    def click_show_more_button(self):
+    def wait_for_meeting_joined(self):
+        """Wait for the bot to be admitted to the meeting by looking for any in-meeting UI element."""
         waiting_room_timeout_started_at = time.time()
         num_attempts = self.automatic_leave_configuration.waiting_room_timeout_seconds * 10
-        logger.info("Waiting for the show more button...")
+        logger.info("Waiting for in-meeting UI to appear...")
         for attempt_index in range(num_attempts):
             try:
-                show_more_button = WebDriverWait(self.driver, 1).until(EC.presence_of_element_located((By.ID, "callingButtons-showMoreBtn")))
-                logger.info("Clicking the show more button...")
-                self.click_element(show_more_button, "click_show_more_button")
+                # Look for any in-meeting toolbar element as a signal that we've joined
+                WebDriverWait(self.driver, 1).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, '#callingButtons-showMoreBtn, [data-inp="hangup-button"], #hangup-button'))
+                )
+                logger.info("In-meeting UI detected, bot has joined the meeting")
                 return
             except TimeoutException:
-                self.look_for_sign_in_required_element("click_show_more_button")
-                self.check_if_blocked_by_captcha("click_show_more_button")
-                self.look_for_denied_your_request_element("click_show_more_button")
-                self.look_for_we_could_not_connect_you_element("click_show_more_button")
+                self.look_for_sign_in_required_element("wait_for_meeting_joined")
+                self.check_if_blocked_by_captcha("wait_for_meeting_joined")
+                self.look_for_denied_your_request_element("wait_for_meeting_joined")
+                self.look_for_we_could_not_connect_you_element("wait_for_meeting_joined")
 
-                self.check_if_waiting_room_timeout_exceeded(waiting_room_timeout_started_at, "click_show_more_button")
+                self.check_if_waiting_room_timeout_exceeded(waiting_room_timeout_started_at, "wait_for_meeting_joined")
 
             except Exception as e:
-                logger.info("Exception raised in locate_element for show_more_button")
-                raise UiCouldNotLocateElementException("Exception raised in locate_element for click_show_more_button", "click_show_more_button", e)
+                logger.info("Exception raised while waiting for in-meeting UI")
+                raise UiCouldNotLocateElementException("Exception raised while waiting for in-meeting UI", "wait_for_meeting_joined", e)
 
     def look_for_sign_in_required_element(self, step):
         sign_in_required_messages = [
@@ -295,10 +307,10 @@ class TeamsUIMethods:
         logger.info("Clicking the Join now button...")
         self.click_element(join_button, "join_button")
 
-        # Wait for meeting to load and enable captions
-        self.click_show_more_button()
+        # Wait for the bot to be admitted to the meeting
+        self.wait_for_meeting_joined()
 
-        # Click the captions button
+        # Enable closed captions (tries programmatic first, falls back to UI)
         self.click_captions_button()
 
         self.set_layout(self.get_layout_to_select())

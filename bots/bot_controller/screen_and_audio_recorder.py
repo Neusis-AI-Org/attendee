@@ -44,7 +44,7 @@ class ScreenAndAudioRecorder:
             ffmpeg_cmd = ["ffmpeg", "-y", "-thread_queue_size", "256", "-framerate", "30", "-video_size", f"{self.screen_dimensions[0]}x{self.screen_dimensions[1]}", "-f", "x11grab", "-draw_mouse", "0", "-probesize", "32", "-i", display_var, "-thread_queue_size", "4096", "-f", "alsa", "-i", "default", "-vf", f"crop={self.recording_dimensions[0]}:{self.recording_dimensions[1]}:10:10", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30", "-c:a", "aac", "-strict", "experimental", "-b:a", "128k", self.file_location]
 
         logger.info(f"Starting FFmpeg command: {' '.join(ffmpeg_cmd)}")
-        self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     # Pauses by muting the audio and showing a black xterm covering the entire screen
     def pause_recording(self):
@@ -81,11 +81,39 @@ class ScreenAndAudioRecorder:
             logger.error(f"Failed to resume recording: {e}")
             return False
 
+    def check_process_health(self):
+        """Check if the FFmpeg process is still alive. Returns True if healthy, False if dead."""
+        if not self.ffmpeg_proc:
+            return True  # No process to check (recording not started or already stopped)
+
+        returncode = self.ffmpeg_proc.poll()
+        if returncode is not None:
+            # FFmpeg has exited unexpectedly
+            stderr_output = ""
+            if self.ffmpeg_proc.stderr:
+                try:
+                    stderr_output = self.ffmpeg_proc.stderr.read().decode("utf-8", errors="replace")
+                except Exception:
+                    stderr_output = "<unable to read stderr>"
+            logger.error(f"FFmpeg process exited unexpectedly with return code {returncode}. stderr: {stderr_output}")
+            self.ffmpeg_proc = None
+            return False
+
+        return True
+
     def stop_recording(self):
         if not self.ffmpeg_proc:
             return
         self.ffmpeg_proc.terminate()
         self.ffmpeg_proc.wait()
+        # Log any FFmpeg output on normal shutdown
+        if self.ffmpeg_proc.stderr:
+            try:
+                stderr_output = self.ffmpeg_proc.stderr.read().decode("utf-8", errors="replace")
+                if stderr_output.strip():
+                    logger.info(f"FFmpeg stderr on shutdown: {stderr_output[-2000:]}")
+            except Exception:
+                pass
         self.ffmpeg_proc = None
         logger.info(f"Stopped screen and audio recorder for display with dimensions {self.screen_dimensions} and file location {self.file_location}")
 

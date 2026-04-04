@@ -614,8 +614,18 @@ class BotController:
                 http_uploader.upload_file(self.get_recording_file_location())
                 http_uploader.wait_for_upload()
                 logger.info("HTTP file upload finished")
-                http_uploader.delete_file(self.get_recording_file_location())
-                logger.info("File uploader deleted file from local filesystem")
+                if http_uploader._upload_success:
+                    http_uploader.delete_file(self.get_recording_file_location())
+                    logger.info("File uploader deleted file from local filesystem")
+                else:
+                    logger.warning("HTTP upload failed, falling back to cloud storage upload")
+                    file_uploader = self.get_file_uploader()
+                    file_uploader.upload_file(self.get_recording_file_location())
+                    file_uploader.wait_for_upload()
+                    logger.info("Fallback cloud storage upload finished")
+                    file_uploader.delete_file(self.get_recording_file_location())
+                    logger.info("File uploader deleted file from local filesystem")
+                    self.recording_file_saved(file_uploader.filename)
             else:
                 logger.info("Telling file uploader to upload recording file...")
                 file_uploader = self.get_file_uploader()
@@ -1251,6 +1261,10 @@ class BotController:
 
             # Process captions
             self.closed_caption_manager.process_captions()
+
+            # Check recording health
+            if self.screen_and_audio_recorder and not self.screen_and_audio_recorder.check_process_health():
+                logger.error("FFmpeg recording process died unexpectedly — audio recording has stopped")
 
             # Check if auto-leave conditions are met
             self.adapter.check_auto_leave_conditions()

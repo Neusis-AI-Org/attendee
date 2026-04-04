@@ -33,10 +33,10 @@ data:
   IS_A_BOT_POD: "false"
 
   # Bot resource defaults
-  BOT_CPU_REQUEST: "4"
-  BOT_MEMORY_REQUEST: "4Gi"
+  BOT_CPU_REQUEST: "2"
+  BOT_MEMORY_REQUEST: "2Gi"
   BOT_MEMORY_LIMIT: "4Gi"
-  BOT_EPHEMERAL_STORAGE_REQUEST: "10Gi"
+  BOT_EPHEMERAL_STORAGE_REQUEST: "5Gi"
 
   # Redis — Memorystore uses private network, no SSL needed
   # Do NOT set DISABLE_REDIS_SSL here; it adds ssl params that conflict with redis:// scheme

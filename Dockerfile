@@ -48,12 +48,20 @@ RUN apt-get update  \
 
 # Install Chrome dependencies
 RUN apt-get install -y xvfb x11-xkb-utils xfonts-100dpi xfonts-75dpi xfonts-scalable xfonts-cyrillic x11-apps libvulkan1 fonts-liberation xdg-utils wget
-# Install a specific version of Chrome.
-RUN wget -q http://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_134.0.6998.88-1_amd64.deb
-RUN apt-get install -y ./google-chrome-stable_134.0.6998.88-1_amd64.deb
+# Install latest stable Chrome.
+RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y ./google-chrome-stable_current_amd64.deb \
+    && rm google-chrome-stable_current_amd64.deb
 
-# Install a specific version of ChromeDriver.
-RUN wget -q https://storage.googleapis.com/chrome-for-testing-public/134.0.6998.88/linux64/chromedriver-linux64.zip \
+# Install matching ChromeDriver via Chrome for Testing JSON endpoints.
+# Uses the known-good-versions endpoint to find the closest matching ChromeDriver.
+RUN CHROME_VERSION=$(google-chrome --version | sed 's/Google Chrome //' | sed 's/ //g') \
+    && CHROME_MAJOR=$(echo "$CHROME_VERSION" | cut -d. -f1) \
+    && echo "Chrome version: $CHROME_VERSION (major: $CHROME_MAJOR)" \
+    && CHROMEDRIVER_URL=$(wget -qO- "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json" \
+       | python3 -c "import sys,json; data=json.load(sys.stdin); versions=[v for v in data['versions'] if v['version'].startswith('${CHROME_MAJOR}.') and 'chromedriver' in v.get('downloads',{})]; print(versions[-1]['downloads']['chromedriver'][next(i for i,p in enumerate(versions[-1]['downloads']['chromedriver']) if p['platform']=='linux64')]['url'])" ) \
+    && echo "ChromeDriver URL: $CHROMEDRIVER_URL" \
+    && wget -q "$CHROMEDRIVER_URL" -O chromedriver-linux64.zip \
     && unzip chromedriver-linux64.zip \
     && mv chromedriver-linux64/chromedriver /usr/local/bin/chromedriver \
     && chmod +x /usr/local/bin/chromedriver \
@@ -121,7 +129,8 @@ ENV cwd=/$project
 WORKDIR $cwd
 
 # Copy only what you need; set ownership/perm at copy time
-COPY --chown=app:app --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chown=app:app entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
 COPY --chown=app:app . .
 
 # Make STATIC_ROOT writeable for the non-root user so collectstatic can run at startup
