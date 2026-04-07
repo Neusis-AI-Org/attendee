@@ -19,7 +19,7 @@ class AutomaticLeaveConfiguration:
 
     silence_timeout_seconds: int = 600
     silence_activate_after_seconds: int = 1200
-    only_participant_in_meeting_timeout_seconds: int = 60
+    only_participant_in_meeting_timeout_seconds: int = 180
     wait_for_host_to_start_meeting_timeout_seconds: int = 600
     waiting_room_timeout_seconds: int = 900
     max_uptime_seconds: int | None = None

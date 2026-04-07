@@ -1535,12 +1535,17 @@ function handleRosterUpdate(eventDataObject) {
         // Teams includes a user with no display name. Not sure what this user is but we don't want to sync that user.
         const participants = Object.values(decodedBody.participants).filter(participant => participant.details?.displayName);
         const callId = extractCallIdFromEventDataObject(eventDataObject);
+
+        // Convert all participants at once and do a full roster sync.
+        // This ensures participants who left (absent from the roster) are detected as removed.
+        // Previously, calling singleUserSynced per participant would merge each with the
+        // existing currentUsersMap, so departed users were never removed.
+        const convertedUsers = participants.map(participant => {
+            return window.userManager.convertUser({ ...participant, callId: callId });
+        });
+        window.userManager.newUsersListSynced(convertedUsers);
+
         for (const participant of participants) {
-            const participantWithCallId = {
-                ...participant,
-                callId: callId
-            };
-            window.userManager.singleUserSynced(participantWithCallId);
             syncVirtualStreamsFromParticipant(participant);
         }
     } catch (error) {
@@ -2826,6 +2831,9 @@ class CallManager {
             };
         }).filter(participant => participant.displayName);
 
+        // Convert all participants at once for a full roster sync.
+        const convertedUsers = [];
+        const participantsForStreamSync = [];
         for (const participant of participants) {
             const endpoints = (participant?.endpoints?.endpointDetails || []).map(endpoint => {
                 if (!endpoint.endpointId) {
@@ -2854,8 +2862,12 @@ class CallManager {
                 endpoints: Object.fromEntries(endpoints),
                 callId: this.getCallId()
             };
-            window.userManager.singleUserSynced(participantConverted);
-            syncVirtualStreamsFromParticipant(participantConverted);
+            convertedUsers.push(window.userManager.convertUser(participantConverted));
+            participantsForStreamSync.push(participantConverted);
+        }
+        window.userManager.newUsersListSynced(convertedUsers);
+        for (const p of participantsForStreamSync) {
+            syncVirtualStreamsFromParticipant(p);
         }
     }
 
