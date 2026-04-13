@@ -553,7 +553,7 @@ class BotController:
         def terminate_worker():
             import time
 
-            time.sleep(600)
+            time.sleep(240)  # 4 min hard timeout (was 10 min — reduced to match faster shutdown)
             if normal_quitting_process_worked:
                 logger.info("Normal quitting process worked, not force terminating worker")
                 return
@@ -615,6 +615,8 @@ class BotController:
                 http_uploader.wait_for_upload()
                 logger.info("HTTP file upload finished")
                 if http_uploader._upload_success:
+                    self.recording_file_saved(http_uploader.filename)
+                    logger.info("Recording file saved event recorded in DB")
                     http_uploader.delete_file(self.get_recording_file_location())
                     logger.info("File uploader deleted file from local filesystem")
                 else:

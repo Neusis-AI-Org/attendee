@@ -346,7 +346,7 @@ class GstreamerPipeline:
             audio_appsrc.emit("end-of-stream")
 
         msg = bus.timed_pop_filtered(
-            5 * 60 * Gst.SECOND,  # 5 minute timeout
+            60 * Gst.SECOND,  # 60 second timeout (was 5 min — too long, risks pod kill)
             Gst.MessageType.EOS | Gst.MessageType.ERROR,
         )
 
