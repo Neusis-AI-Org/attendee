@@ -1,5 +1,6 @@
 import io
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -295,7 +296,7 @@ def get_transcription_via_assemblyai_from_mp3(
 
     data = {
         "audio_url": upload_url,
-        "speech_model": "universal",
+        "speech_models": ["universal-3-pro", "universal-2"],
     }
 
     if transcription_settings.assembly_ai_language_detection():
@@ -309,7 +310,14 @@ def get_transcription_via_assemblyai_from_mp3(
         data["keyterms_prompt"] = keyterms_prompt
     speech_model = transcription_settings.assemblyai_speech_model()
     if speech_model:
+        if "speech_models" in data:
+            del data["speech_models"]
         data["speech_model"] = speech_model
+    speech_models = transcription_settings.assemblyai_speech_models()
+    if speech_models:
+        if "speech_model" in data:
+            del data["speech_model"]
+        data["speech_models"] = speech_models
 
     if transcription_settings.assemblyai_speaker_labels():
         data["speaker_labels"] = True
@@ -328,7 +336,7 @@ def get_transcription_via_assemblyai_from_mp3(
     polling_endpoint = f"{base_url}/transcript/{transcript_id}"
 
     # Poll the result_url until we get a completed transcription
-    max_retries = 120  # Maximum number of retries (2 minutes with 1s sleep)
+    max_retries = int(os.getenv("TRANSCRIPTION_POLLING_TIMEOUT_SECONDS", 120))  # Maximum number of retries (2 minutes with 1s sleep)
     retry_count = 0
 
     while retry_count < max_retries:

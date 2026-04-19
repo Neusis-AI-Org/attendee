@@ -95,6 +95,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "csp.middleware.CSPMiddleware",
     "allauth.account.middleware.AccountMiddleware",
 ]
 
@@ -197,6 +198,12 @@ CELERY_TASK_ROUTES = {
         "queue": os.getenv("DELIVER_WEBHOOK_CELERY_QUEUE", "celery"),
     },
 }
+
+if os.getenv("LAUNCH_BOT_METHOD") != "kubernetes" and os.getenv("LAUNCH_BOT_METHOD") != "docker-compose-multi-host":
+    # This setting means that each celery worker process will be recreated after each task.
+    # Needed because latest Zoom SDK has segfault issue unless we recreate the process after each bot.
+    CELERY_WORKER_MAX_TASKS_PER_CHILD = 1
+
 if os.getenv("IS_A_BOT_POD", "false") == "true" and os.getenv("CONSERVE_BOT_POD_REDIS_CONNECTIONS", "false") == "true":
     # Setting this to 1 means that bot pods keep one celery broker pool connection alive for the duration of the bot.
     # Note: this results in 2 underlying Redis connections (one for commands, one for pub/sub).
@@ -317,6 +324,25 @@ SITE_DOMAIN = os.getenv("SITE_DOMAIN", "app.attendee.dev")
 MASK_TRANSCRIPT_IN_LOGS = os.getenv("MASK_TRANSCRIPT_IN_LOGS", "false") == "true"
 ENFORCE_DOMAIN_ALLOWLIST_IN_CHROME = os.getenv("ENFORCE_DOMAIN_ALLOWLIST_IN_CHROME", "false") == "true"
 CUSTOM_BOT_POD_SPEC_TYPES = os.getenv("CUSTOM_BOT_POD_SPEC_TYPES", "").split(",") if os.getenv("CUSTOM_BOT_POD_SPEC_TYPES") else []
+GLOBAL_WEBHOOK_DELIVERIES_PER_SECOND_RATE_LIMIT = int(os.getenv("GLOBAL_WEBHOOK_DELIVERIES_PER_SECOND_RATE_LIMIT")) if os.getenv("GLOBAL_WEBHOOK_DELIVERIES_PER_SECOND_RATE_LIMIT") else None
+
+# Content Security Policy
+if os.getenv("ENABLE_CSP", "false") == "true":
+    _csp_media_src = [d for d in os.getenv("CSP_MEDIA_SRC", "").split(",") if d]
+    CONTENT_SECURITY_POLICY = {
+        "DIRECTIVES": {
+            "default-src": ["'self'"],
+            "script-src": ["'self'", "'unsafe-inline'", "https://unpkg.com", "https://cdn.jsdelivr.net"],
+            "style-src": ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net"],
+            "font-src": ["'self'", "https://cdn.jsdelivr.net"],
+            "img-src": ["'self'", "data:"] + _csp_media_src,
+            "media-src": ["'self'"] + _csp_media_src,
+            "connect-src": ["'self'", "https://cdn.jsdelivr.net"],
+            "frame-src": ["https://www.loom.com"],
+            "base-uri": ["'self'"],
+            "form-action": ["'self'", "https://*.stripe.com"],
+        },
+    }
 
 # Initialize Sentry (only if SENTRY_DSN is set)
 init_sentry()

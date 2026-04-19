@@ -48,10 +48,11 @@ RUN apt-get update  \
 
 # Install Chrome dependencies
 RUN apt-get install -y xvfb x11-xkb-utils xfonts-100dpi xfonts-75dpi xfonts-scalable xfonts-cyrillic x11-apps libvulkan1 fonts-liberation xdg-utils wget
-# Install latest stable Chrome.
-RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
-    && apt-get install -y ./google-chrome-stable_current_amd64.deb \
-    && rm google-chrome-stable_current_amd64.deb
+# Install a specific version of Chrome.
+RUN wget -q https://mirror.cs.uchicago.edu/google-chrome/pool/main/g/google-chrome-stable/google-chrome-stable_134.0.6998.88-1_amd64.deb
+# Verify that the package is correct, since this is a mirror.
+RUN echo "df557edb3d24d8dcaff9557d80733b42afb6626685200d3f34a3b6f528065cad  google-chrome-stable_134.0.6998.88-1_amd64.deb" | sha256sum -c -
+RUN apt-get install -y ./google-chrome-stable_134.0.6998.88-1_amd64.deb
 
 # Install matching ChromeDriver via Chrome for Testing JSON endpoints.
 # Uses the known-good-versions endpoint to find the closest matching ChromeDriver.

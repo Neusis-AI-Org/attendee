@@ -111,3 +111,5 @@ deploy/terraform/terraform.tfstate.backup
 deploy/terraform/tfplan
 deploy/terraform/*.tfvars
 !deploy/terraform/*.tfvars.example
+
+.idea/
