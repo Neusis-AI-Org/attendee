@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 from pathlib import Path
 
@@ -10,17 +11,21 @@ logger.setLevel(logging.INFO)
 
 class HTTPFileUploader:
     """
-    Uploads a recording file via HTTP POST (multipart/form-data) to an external URL.
-    Same interface as GCSFileUploader so it can be used as a drop-in replacement.
+    Uploads a recording file to GCS (via Workload Identity) and then
+    notifies the bot-scheduler via a lightweight HTTP POST with the GCS path.
+
+    Falls back to direct HTTP multipart upload for files under 30MB.
 
     Robustness improvements:
     - Non-daemon thread (survives main thread exit)
-    - 3 retry attempts with 120-second timeout each
+    - GCS upload for large files (no size limit)
+    - 3 retry attempts for HTTP notification
     - Logs progress at each stage
     """
 
     MAX_RETRIES = 3
     UPLOAD_TIMEOUT = 120  # seconds per attempt
+    DIRECT_UPLOAD_MAX_BYTES = 30 * 1024 * 1024  # 30MB — Cloud Run limit
 
     def __init__(self, upload_url, filename, bot_id, bot_object_id, meeting_url=None):
         self.upload_url = upload_url
@@ -47,9 +52,76 @@ class HTTPFileUploader:
                 callback(False)
             return
 
-        file_size_mb = file_path.stat().st_size / 1024 / 1024
-        logger.info(f"Starting HTTP upload: {file_path.name} ({file_size_mb:.1f} MB) to {self.upload_url}")
+        file_size = file_path.stat().st_size
+        file_size_mb = file_size / 1024 / 1024
+        logger.info(f"Starting upload: {file_path.name} ({file_size_mb:.1f} MB)")
 
+        if file_size > self.DIRECT_UPLOAD_MAX_BYTES:
+            # Large file: upload to GCS first, then notify
+            success = self._upload_via_gcs(file_path, file_size_mb)
+        else:
+            # Small file: direct HTTP multipart upload
+            success = self._upload_direct(file_path, file_size_mb)
+
+        self._upload_success = success
+        if callback:
+            callback(success)
+
+    def _upload_via_gcs(self, file_path: Path, file_size_mb: float) -> bool:
+        """Upload large file to GCS, then send lightweight notification."""
+        gcs_bucket = os.getenv("GCS_RECORDING_BUCKET") or os.getenv("AWS_RECORDING_STORAGE_BUCKET_NAME")
+        gcs_project = os.getenv("GCS_PROJECT_ID")
+
+        if not gcs_bucket or not gcs_project:
+            logger.warning(f"GCS not configured, falling back to direct upload for {file_size_mb:.1f} MB file")
+            return self._upload_direct(file_path, file_size_mb)
+
+        try:
+            from google.cloud import storage
+            client = storage.Client(project=gcs_project)
+            bucket = client.bucket(gcs_bucket)
+            gcs_path = f"recordings/{self.bot_object_id}-{self.filename}"
+            blob = bucket.blob(gcs_path)
+
+            logger.info(f"Uploading {file_size_mb:.1f} MB to GCS: gs://{gcs_bucket}/{gcs_path}")
+            blob.upload_from_filename(str(file_path), content_type="audio/mpeg")
+            logger.info(f"GCS upload complete: gs://{gcs_bucket}/{gcs_path}")
+
+            # Notify bot-scheduler with GCS path (lightweight, no file data)
+            for attempt in range(1, self.MAX_RETRIES + 1):
+                try:
+                    response = requests.post(
+                        self.upload_url,
+                        json={
+                            "bot_id": self.bot_object_id,
+                            "bot_db_id": str(self.bot_id),
+                            "filename": self.filename,
+                            "meeting_url": self.meeting_url,
+                            "gcs_path": f"gs://{gcs_bucket}/{gcs_path}",
+                        },
+                        timeout=30,
+                    )
+                    if response.ok:
+                        logger.info(f"Bot-scheduler notified of GCS upload (attempt {attempt})")
+                        return True
+                    logger.warning(f"Notification attempt {attempt} failed: {response.status_code}")
+                except Exception as e:
+                    logger.warning(f"Notification attempt {attempt} failed: {e}")
+
+                if attempt < self.MAX_RETRIES:
+                    import time
+                    time.sleep(attempt * 5)
+
+            # Even if notification fails, recording is safe in GCS
+            logger.warning("Notification failed but recording is in GCS — bot-scheduler can retrieve it later")
+            return True
+
+        except Exception as e:
+            logger.error(f"GCS upload failed: {e}, falling back to direct upload")
+            return self._upload_direct(file_path, file_size_mb)
+
+    def _upload_direct(self, file_path: Path, file_size_mb: float) -> bool:
+        """Direct HTTP multipart upload (for files under 30MB)."""
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
                 with open(file_path, "rb") as f:
@@ -62,7 +134,7 @@ class HTTPFileUploader:
                     if self.meeting_url:
                         data["meeting_url"] = self.meeting_url
 
-                    logger.info(f"HTTP upload attempt {attempt}/{self.MAX_RETRIES} ({file_size_mb:.1f} MB)...")
+                    logger.info(f"Direct HTTP upload attempt {attempt}/{self.MAX_RETRIES} ({file_size_mb:.1f} MB)...")
                     response = requests.post(
                         self.upload_url,
                         files=files,
@@ -71,27 +143,20 @@ class HTTPFileUploader:
                     )
                     response.raise_for_status()
 
-                logger.info(f"HTTP upload succeeded on attempt {attempt} (status={response.status_code})")
-                self._upload_success = True
-
-                if callback:
-                    callback(True)
-                return
+                logger.info(f"Direct upload succeeded on attempt {attempt}")
+                return True
 
             except requests.Timeout:
-                logger.warning(f"HTTP upload attempt {attempt} timed out after {self.UPLOAD_TIMEOUT}s")
+                logger.warning(f"Direct upload attempt {attempt} timed out after {self.UPLOAD_TIMEOUT}s")
             except Exception as e:
-                logger.warning(f"HTTP upload attempt {attempt} failed: {e}")
+                logger.warning(f"Direct upload attempt {attempt} failed: {e}")
 
             if attempt < self.MAX_RETRIES:
                 import time
-                wait = attempt * 5  # 5s, 10s backoff
-                logger.info(f"Retrying HTTP upload in {wait}s...")
-                time.sleep(wait)
+                time.sleep(attempt * 5)
 
-        logger.error(f"HTTP upload failed after {self.MAX_RETRIES} attempts for {file_path.name}")
-        if callback:
-            callback(False)
+        logger.error(f"Direct upload failed after {self.MAX_RETRIES} attempts for {file_path.name}")
+        return False
 
     def wait_for_upload(self):
         if self._upload_thread and self._upload_thread.is_alive():
