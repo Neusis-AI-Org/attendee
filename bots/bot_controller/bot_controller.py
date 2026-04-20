@@ -638,7 +638,8 @@ class BotController:
             logger.info("Telling websocket client manager to cleanup...")
             self.websocket_client_manager.cleanup()
 
-        if self.get_recording_file_location():
+        recording_file = self.get_recording_file_location()
+        if recording_file and os.path.exists(recording_file) and os.path.getsize(recording_file) > 0:
             self.upload_recording_to_external_media_storage_if_enabled()
 
             recording_upload_url = os.getenv("RECORDING_UPLOAD_URL")
