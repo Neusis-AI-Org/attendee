@@ -1015,6 +1015,8 @@ class BotController:
             logger.info("take_action_based_on_bot_in_db - LEAVING")
             BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
             self.adapter.leave()
+            self.flush_utterances()
+            self.cleanup()
         if self.bot_in_db.state == BotStates.STAGED:
             logger.info(f"take_action_based_on_bot_in_db - STAGED. For now, this is a no-op. join_at = {self.bot_in_db.join_at.isoformat()}")
 
@@ -1899,6 +1901,8 @@ class BotController:
             BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.LEAVE_REQUESTED, event_sub_type=event_sub_type_for_reason)
             BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
             self.adapter.leave()
+            self.flush_utterances()
+            self.cleanup()
             return
 
         if message.get("message") == BotAdapter.Messages.MEETING_ENDED:

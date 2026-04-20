@@ -839,6 +839,7 @@ class WebBotAdapter(BotAdapter):
         mhtml_file_path_right_before_leave = None
         try:
             logger.info("disable media sending")
+            self.driver.set_script_timeout(10)
             self.driver.execute_script("window.ws?.disableMediaSending();")
 
             screenshot_path_right_before_leave, mhtml_file_path_right_before_leave, _ = self.capture_screenshot_and_mhtml_file()
