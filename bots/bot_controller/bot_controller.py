@@ -1901,8 +1901,11 @@ class BotController:
 
             BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.LEAVE_REQUESTED, event_sub_type=event_sub_type_for_reason)
             BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
-            self.adapter.leave()
             self.flush_utterances()
+            # Call cleanup() directly — it handles adapter.leave() internally
+            # and has a terminate_worker timeout to prevent hanging.
+            # Previously adapter.leave() was called separately and could hang
+            # indefinitely, preventing cleanup() from ever running.
             self.cleanup()
             return
 
