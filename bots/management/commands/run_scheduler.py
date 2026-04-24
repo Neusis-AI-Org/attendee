@@ -15,6 +15,7 @@ from django.utils import timezone
 
 from accounts.models import Organization
 from bots.models import Bot, BotStates, Calendar, CalendarStates, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from bots.tasks.auto_create_bots_for_calendar_events_task import auto_create_bots_for_calendar_events
 from bots.tasks.autopay_charge_task import enqueue_autopay_charge_task
 from bots.tasks.launch_scheduled_bot_task import launch_scheduled_bot
 from bots.tasks.refresh_zoom_oauth_connection_task import enqueue_refresh_zoom_oauth_connection_task
@@ -87,6 +88,7 @@ class Command(BaseCommand):
                 self._run_periodic_zoom_oauth_connection_token_refreshs()
                 self._run_autopay_tasks()
                 self._clean_up_stale_bots()
+                self._run_auto_create_bots_for_calendar_events()
             except Exception:
                 log.exception("Scheduler cycle failed")
             finally:
@@ -303,3 +305,13 @@ class Command(BaseCommand):
             call_command("clean_up_bots_with_heartbeat_timeout_or_that_never_launched")
         except Exception:
             log.exception("Failed to clean up stale bots")
+
+    def _run_auto_create_bots_for_calendar_events(self):
+        """
+        Scan connected calendars for upcoming events that have a meeting URL
+        and create scheduled bots for them.
+        """
+        try:
+            auto_create_bots_for_calendar_events()
+        except Exception:
+            log.exception("Failed to auto-create bots for calendar events")

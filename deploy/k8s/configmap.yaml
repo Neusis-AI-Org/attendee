@@ -18,9 +18,9 @@ data:
   # Bot launch method — "kubernetes" runs each bot as its own K8s pod
   LAUNCH_BOT_METHOD: "kubernetes"
 
-  # HTTP recording upload — bot POSTs mp3 directly to this URL instead of GCS
-  # Remove or leave empty to use GCS upload instead
-  RECORDING_UPLOAD_URL: "https://<your-bot-handler>/api/recordings/upload"
+  # HTTP recording upload — bot POSTs mp3 directly to this URL instead of GCS.
+  # Empty means use the native GCS uploader directly (via Workload Identity).
+  RECORDING_UPLOAD_URL: ""
 
   # Bot pods
   BOT_POD_NAMESPACE: "attendee"

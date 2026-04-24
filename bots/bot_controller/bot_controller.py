@@ -1015,8 +1015,10 @@ class BotController:
         if self.bot_in_db.state == BotStates.LEAVING:
             logger.info("take_action_based_on_bot_in_db - LEAVING")
             BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
-            self.adapter.leave()
             self.flush_utterances()
+            # cleanup() calls adapter.leave() internally under a terminate_worker
+            # timeout — calling adapter.leave() separately here risks hanging
+            # before cleanup() ever runs.
             self.cleanup()
         if self.bot_in_db.state == BotStates.STAGED:
             logger.info(f"take_action_based_on_bot_in_db - STAGED. For now, this is a no-op. join_at = {self.bot_in_db.join_at.isoformat()}")
