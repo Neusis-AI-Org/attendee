@@ -104,8 +104,19 @@ class ScreenAndAudioRecorder:
     def stop_recording(self):
         if not self.ffmpeg_proc:
             return
+        # ffmpeg can block in an uninterruptible ALSA read syscall and ignore SIGTERM.
+        # Without a timeout this would hang cleanup() indefinitely and the pod would
+        # be SIGKILLed before the recording is uploaded.
         self.ffmpeg_proc.terminate()
-        self.ffmpeg_proc.wait()
+        try:
+            self.ffmpeg_proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            logger.warning("FFmpeg did not exit within 15s of SIGTERM, sending SIGKILL")
+            self.ffmpeg_proc.kill()
+            try:
+                self.ffmpeg_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.error("FFmpeg did not exit within 5s of SIGKILL — abandoning")
         # Log any FFmpeg output on normal shutdown
         if self.ffmpeg_proc.stderr:
             try:
