@@ -147,7 +147,7 @@ resource "google_sql_database_instance" "postgres" {
     tier              = var.db_tier
     disk_size         = var.db_disk_size
     disk_autoresize   = true
-    availability_type = var.environment == "production" ? "REGIONAL" : "ZONAL"
+    availability_type = var.db_availability_type
 
     ip_configuration {
       ipv4_enabled                                  = false

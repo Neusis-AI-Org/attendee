@@ -43,6 +43,12 @@ variable "db_disk_size" {
   default     = 20
 }
 
+variable "db_availability_type" {
+  description = "Cloud SQL availability type: ZONAL (cheaper) or REGIONAL (HA with automatic failover)"
+  type        = string
+  default     = "ZONAL"
+}
+
 variable "db_name" {
   description = "PostgreSQL database name"
   type        = string

@@ -311,6 +311,10 @@ class Command(BaseCommand):
         Scan connected calendars for upcoming events that have a meeting URL
         and create scheduled bots for them.
         """
+        if os.getenv("DISABLE_INTERNAL_AUTO_CREATE_BOTS", "").lower() in ("1", "true", "yes"):
+            # Skip when an external scheduler is the source of bot creation —
+            # otherwise both paths fire and produce duplicate bots in the same meeting.
+            return
         try:
             auto_create_bots_for_calendar_events()
         except Exception:
