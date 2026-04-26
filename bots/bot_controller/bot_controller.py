@@ -687,6 +687,18 @@ class BotController:
         if self.audio_chunk_uploader:
             self.audio_chunk_uploader.shutdown()
 
+        # The MEETING_ENDED message handler is what normally transitions the bot
+        # from LEAVING to POST_PROCESSING (via the BOT_LEFT_MEETING event). That
+        # handler runs on the Redis listener thread, which can be torn down during
+        # cleanup before it consumes the queued message — leaving the bot stuck
+        # in LEAVING and skipping POST_PROCESSING_COMPLETED. Force the transition
+        # here if needed so the post-processing webhook always fires.
+        self.bot_in_db.refresh_from_db()
+        if self.bot_in_db.state == BotStates.LEAVING:
+            logger.info("Bot still in LEAVING after upload; forcing BOT_LEFT_MEETING")
+            BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.BOT_LEFT_MEETING)
+            self.bot_in_db.refresh_from_db()
+
         if self.bot_in_db.state == BotStates.POST_PROCESSING:
             self.wait_until_all_utterances_are_terminated()
             BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.POST_PROCESSING_COMPLETED)
