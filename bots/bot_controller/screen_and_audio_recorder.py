@@ -24,16 +24,21 @@ class ScreenAndAudioRecorder:
         logger.info(f"Starting screen recorder for display {display_var} with dimensions {self.screen_dimensions} and file location {self.file_location}")
 
         if self.audio_only:
-            # FFmpeg command for audio-only recording to MP3
+            # FFmpeg command for audio-only recording to MP3.
+            # Using `-f pulse -i auto_null.monitor` instead of `-f alsa -i default`
+            # to bypass the ALSA-on-Pulse plugin (which has been silently capping
+            # recordings at exactly 10 MiB / ~7 min — see AUDIO_DIAG findings).
+            # `-flush_packets 1` forces ffmpeg to flush after every encoded packet
+            # so the output never accumulates in an internal IO buffer.
             ffmpeg_cmd = [
                 "ffmpeg",
                 "-y",  # Overwrite output file without asking
                 "-thread_queue_size",
                 "4096",
                 "-f",
-                "alsa",  # Audio input format for Linux
+                "pulse",  # PulseAudio input (direct, skips ALSA bridge)
                 "-i",
-                "default",  # Default audio input device
+                "auto_null.monitor",  # Monitor source of the null sink Chrome plays into
                 "-c:a",
                 "libmp3lame",  # MP3 codec
                 "-b:a",
@@ -42,6 +47,8 @@ class ScreenAndAudioRecorder:
                 "44100",  # Sample rate
                 "-ac",
                 "1",  # Mono
+                "-flush_packets",
+                "1",  # Flush every packet — no internal output buffering
                 self.file_location,
             ]
         else:
