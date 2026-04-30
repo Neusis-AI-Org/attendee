@@ -1,6 +1,8 @@
 import logging
 import os
 import subprocess
+import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +17,8 @@ class ScreenAndAudioRecorder:
         self.audio_only = audio_only
         self.paused = False
         self.xterm_proc = None
+        self._diag_thread = None
+        self._diag_stop = threading.Event()
 
     def start_recording(self, display_var):
         logger.info(f"Starting screen recorder for display {display_var} with dimensions {self.screen_dimensions} and file location {self.file_location}")
@@ -45,6 +49,12 @@ class ScreenAndAudioRecorder:
 
         logger.info(f"Starting FFmpeg command: {' '.join(ffmpeg_cmd)}")
         self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        # Diagnostic thread: every 30s, log file growth + PulseAudio pipeline state.
+        # This is read-only — used to localize where audio capture stops on long meetings.
+        self._diag_stop.clear()
+        self._diag_thread = threading.Thread(target=self._audio_pipeline_diagnostic_loop, daemon=True)
+        self._diag_thread.start()
 
     # Pauses by muting the audio and showing a black xterm covering the entire screen
     def pause_recording(self):
@@ -101,9 +111,58 @@ class ScreenAndAudioRecorder:
 
         return True
 
+    def _audio_pipeline_diagnostic_loop(self):
+        last_size = -1
+        last_growth_at = time.time()
+        started_at = time.time()
+        while not self._diag_stop.wait(30):
+            try:
+                size = os.path.getsize(self.file_location) if os.path.exists(self.file_location) else -1
+                growing = size > last_size
+                if growing:
+                    last_growth_at = time.time()
+                stalled_for = int(time.time() - last_growth_at) if not growing else 0
+                elapsed = int(time.time() - started_at)
+
+                def pactl(args, timeout=3):
+                    try:
+                        out = subprocess.check_output(["pactl"] + args, stderr=subprocess.STDOUT, timeout=timeout)
+                        return out.decode("utf-8", "replace").strip()
+                    except Exception as e:
+                        return f"<pactl error: {e}>"
+
+                sink_inputs = pactl(["list", "short", "sink-inputs"])  # Chrome -> auto_null
+                source_outputs = pactl(["list", "short", "source-outputs"])  # ffmpeg <- auto_null.monitor
+                sinks = pactl(["list", "short", "sinks"])
+
+                # Look for "CORKED" / "SUSPENDED" markers in the long form for sink-inputs
+                sink_input_full = pactl(["list", "sink-inputs"])
+                corked = "Corked: yes" in sink_input_full
+                suspended_marker = "RUNNING" not in (pactl(["list", "sinks"]) or "")
+
+                logger.info(
+                    "AUDIO_DIAG t+%ds size=%d growing=%s stalled_for=%ds corked=%s sink_running=%s | sink_inputs=[%s] | source_outputs=[%s] | sinks=[%s]",
+                    elapsed,
+                    size,
+                    growing,
+                    stalled_for,
+                    corked,
+                    not suspended_marker,
+                    sink_inputs.replace("\n", " | "),
+                    source_outputs.replace("\n", " | "),
+                    sinks.replace("\n", " | "),
+                )
+                last_size = size
+            except Exception:
+                logger.exception("AUDIO_DIAG loop error")
+
     def stop_recording(self):
         if not self.ffmpeg_proc:
             return
+        # Stop diagnostic thread first so it doesn't race with ffmpeg shutdown
+        self._diag_stop.set()
+        if self._diag_thread and self._diag_thread.is_alive():
+            self._diag_thread.join(timeout=2)
         # ffmpeg can block in an uninterruptible ALSA read syscall and ignore SIGTERM.
         # Without a timeout this would hang cleanup() indefinitely and the pod would
         # be SIGKILLed before the recording is uploaded.
