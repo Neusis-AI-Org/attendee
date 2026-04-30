@@ -19,6 +19,7 @@ class ScreenAndAudioRecorder:
         self.xterm_proc = None
         self._diag_thread = None
         self._diag_stop = threading.Event()
+        self._parec_proc = None
 
     def start_recording(self, display_var):
         logger.info(f"Starting screen recorder for display {display_var} with dimensions {self.screen_dimensions} and file location {self.file_location}")
@@ -56,6 +57,29 @@ class ScreenAndAudioRecorder:
 
         logger.info(f"Starting FFmpeg command: {' '.join(ffmpeg_cmd)}")
         self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        # Sidecar parec reader on the same Pulse source. Independent of ffmpeg —
+        # if it ALSO stops at ~7.5 min the cap is upstream of ffmpeg (Chrome / Pulse).
+        # If it keeps reading while ffmpeg's mp3 freezes, the cap is inside ffmpeg.
+        # Output goes to /dev/null; we sample bytes-read via /proc/<pid>/io.rchar.
+        if self.audio_only:
+            try:
+                self._parec_proc = subprocess.Popen(
+                    [
+                        "parec",
+                        "--device=auto_null.monitor",
+                        "--raw",
+                        "--rate=44100",
+                        "--channels=1",
+                        "--format=s16le",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                logger.info(f"Started parec sidecar pid={self._parec_proc.pid} for upstream-vs-ffmpeg comparison")
+            except Exception as e:
+                logger.warning(f"Could not start parec sidecar: {e}")
+                self._parec_proc = None
 
         # Diagnostic thread: every 30s, log file growth + PulseAudio pipeline state.
         # This is read-only — used to localize where audio capture stops on long meetings.
@@ -122,6 +146,8 @@ class ScreenAndAudioRecorder:
         last_size = -1
         last_growth_at = time.time()
         started_at = time.time()
+        last_parec_rchar = -1
+        last_parec_growth_at = time.time()
         while not self._diag_stop.wait(30):
             try:
                 size = os.path.getsize(self.file_location) if os.path.exists(self.file_location) else -1
@@ -131,6 +157,34 @@ class ScreenAndAudioRecorder:
                 stalled_for = int(time.time() - last_growth_at) if not growing else 0
                 elapsed = int(time.time() - started_at)
 
+                # Sidecar parec process — tracks whether Pulse is still delivering
+                # samples to ANYONE on the same source. If parec keeps reading while
+                # ffmpeg's mp3 freezes, the bug is inside ffmpeg.
+                parec_rchar = -1
+                parec_growing = "n/a"
+                parec_stalled = 0
+                parec_alive = "no_proc"
+                if self._parec_proc is not None:
+                    if self._parec_proc.poll() is None:
+                        parec_alive = "running"
+                        try:
+                            with open(f"/proc/{self._parec_proc.pid}/io") as f:
+                                for line in f:
+                                    if line.startswith("rchar:"):
+                                        parec_rchar = int(line.split()[1])
+                                        break
+                            if parec_rchar > last_parec_rchar:
+                                parec_growing = "True"
+                                last_parec_growth_at = time.time()
+                            else:
+                                parec_growing = "False"
+                            parec_stalled = int(time.time() - last_parec_growth_at) if parec_growing == "False" else 0
+                            last_parec_rchar = parec_rchar
+                        except Exception as e:
+                            parec_alive = f"io_err:{e}"
+                    else:
+                        parec_alive = f"exited_rc={self._parec_proc.returncode}"
+
                 def pactl(args, timeout=3):
                     try:
                         out = subprocess.check_output(["pactl"] + args, stderr=subprocess.STDOUT, timeout=timeout)
@@ -139,7 +193,7 @@ class ScreenAndAudioRecorder:
                         return f"<pactl error: {e}>"
 
                 sink_inputs = pactl(["list", "short", "sink-inputs"])  # Chrome -> auto_null
-                source_outputs = pactl(["list", "short", "source-outputs"])  # ffmpeg <- auto_null.monitor
+                source_outputs = pactl(["list", "short", "source-outputs"])  # ffmpeg + parec <- auto_null.monitor
                 sinks = pactl(["list", "short", "sinks"])
 
                 # Look for "CORKED" / "SUSPENDED" markers in the long form for sink-inputs
@@ -148,11 +202,15 @@ class ScreenAndAudioRecorder:
                 suspended_marker = "RUNNING" not in (pactl(["list", "sinks"]) or "")
 
                 logger.info(
-                    "AUDIO_DIAG t+%ds size=%d growing=%s stalled_for=%ds corked=%s sink_running=%s | sink_inputs=[%s] | source_outputs=[%s] | sinks=[%s]",
+                    "AUDIO_DIAG t+%ds size=%d growing=%s stalled_for=%ds | parec=%s rchar=%d parec_growing=%s parec_stalled=%ds | corked=%s sink_running=%s | sink_inputs=[%s] | source_outputs=[%s] | sinks=[%s]",
                     elapsed,
                     size,
                     growing,
                     stalled_for,
+                    parec_alive,
+                    parec_rchar,
+                    parec_growing,
+                    parec_stalled,
                     corked,
                     not suspended_marker,
                     sink_inputs.replace("\n", " | "),
@@ -170,6 +228,15 @@ class ScreenAndAudioRecorder:
         self._diag_stop.set()
         if self._diag_thread and self._diag_thread.is_alive():
             self._diag_thread.join(timeout=2)
+        # Stop parec sidecar (read-only, just for diagnostics)
+        if self._parec_proc and self._parec_proc.poll() is None:
+            try:
+                self._parec_proc.terminate()
+                self._parec_proc.wait(timeout=3)
+            except Exception:
+                try: self._parec_proc.kill()
+                except Exception: pass
+            self._parec_proc = None
         # ffmpeg can block in an uninterruptible ALSA read syscall and ignore SIGTERM.
         # Without a timeout this would hang cleanup() indefinitely and the pod would
         # be SIGKILLed before the recording is uploaded.
