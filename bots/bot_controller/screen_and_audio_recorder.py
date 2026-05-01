@@ -26,20 +26,18 @@ class ScreenAndAudioRecorder:
 
         if self.audio_only:
             # FFmpeg command for audio-only recording to MP3.
-            # Using `-f pulse -i auto_null.monitor` instead of `-f alsa -i default`
-            # to bypass the ALSA-on-Pulse plugin (which has been silently capping
-            # recordings at exactly 10 MiB / ~7 min — see AUDIO_DIAG findings).
-            # `-flush_packets 1` forces ffmpeg to flush after every encoded packet
-            # so the output never accumulates in an internal IO buffer.
+            # Reverted to the exact form bot 101 used (which captured 44 min),
+            # paired with disabling Pulse's module-suspend-on-idle in entrypoint.sh.
+            # See bot-flow-architecture.md for the truncation investigation.
             ffmpeg_cmd = [
                 "ffmpeg",
                 "-y",  # Overwrite output file without asking
                 "-thread_queue_size",
                 "4096",
                 "-f",
-                "pulse",  # PulseAudio input (direct, skips ALSA bridge)
+                "alsa",  # ALSA input (configured via ~/.asoundrc to use pulse)
                 "-i",
-                "auto_null.monitor",  # Monitor source of the null sink Chrome plays into
+                "default",  # Default ALSA device
                 "-c:a",
                 "libmp3lame",  # MP3 codec
                 "-b:a",
@@ -48,8 +46,6 @@ class ScreenAndAudioRecorder:
                 "44100",  # Sample rate
                 "-ac",
                 "1",  # Mono
-                "-flush_packets",
-                "1",  # Flush every packet — no internal output buffering
                 self.file_location,
             ]
         else:
@@ -168,9 +164,12 @@ class ScreenAndAudioRecorder:
                     if self._parec_proc.poll() is None:
                         parec_alive = "running"
                         try:
+                            # Track wchar: parec reads audio from a Pulse socket and writes
+                            # it to stdout (/dev/null). Socket reads don't count in rchar,
+                            # but the write side does — wchar is the real audio-flow signal.
                             with open(f"/proc/{self._parec_proc.pid}/io") as f:
                                 for line in f:
-                                    if line.startswith("rchar:"):
+                                    if line.startswith("wchar:"):
                                         parec_rchar = int(line.split()[1])
                                         break
                             if parec_rchar > last_parec_rchar:

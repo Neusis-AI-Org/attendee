@@ -71,6 +71,17 @@ fi
 for i in {1..50}; do pactl info >/dev/null 2>&1 && break; sleep 0.1; done
 pactl info >/dev/null || die "pactl cannot reach PulseAudio"
 
+# Unload module-suspend-on-idle. This module suspends sinks/sources after a few
+# seconds of idle and has been a suspected cause of the audio truncation we saw
+# (recordings capping at ~7 min while ffmpeg keeps running). Idempotent — if not
+# loaded, the unload is a no-op. We log either way to make the state observable.
+if pactl list short modules | awk '{print $2}' | grep -qx "module-suspend-on-idle"; then
+  echo "[entrypoint] unloading module-suspend-on-idle"
+  pactl unload-module module-suspend-on-idle || true
+else
+  echo "[entrypoint] module-suspend-on-idle not loaded (already)"
+fi
+
 if [[ "${PA_DEBUG:-0}" = "1" ]]; then
   echo "==== PACTL INFO ===="
   pactl info || true
