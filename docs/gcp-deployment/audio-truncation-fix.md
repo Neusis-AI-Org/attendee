@@ -2,7 +2,10 @@
 
 **Date:** 2026-04-30 → 2026-05-01
 **Branch:** `akg-dev`
-**Final commit:** `16b96272` — `fix: rotate ffmpeg output every N seconds to defeat the ~7.5min cap`
+**Final commit:** `65a3bdd1` — `fix: replace ffmpeg with parec | lame for audio capture`
+**Earlier (partial) fix:** `16b96272` — `fix: rotate ffmpeg output every N seconds` (moved cap from 7.5 min → 10 min, did not eliminate it)
+
+> **TL;DR** — ffmpeg's audio-side libavformat input has a ~10 min cap that **cannot** be defeated from outside ffmpeg, even by rotating output via the segment muxer. Replacing the audio capture path entirely with `parec | lame` (no ffmpeg in the audio path) fixes it. The video path (`audio_only=false`) still uses ffmpeg and is unaffected.
 
 ## Symptom
 
@@ -57,116 +60,141 @@ Theory: Pulse's default `module-suspend-on-idle` suspends idle sinks after a few
 
 **Result:** still capped at exactly 10 MiB / 7m 27s. Module-suspend-on-idle was not the variable.
 
-## Root cause
-
-**ffmpeg's per-output-context audio pipeline (libavformat reader → libmp3lame encoder → mp3 muxer) hits an internal state at ~7.5 min that stops it from reading new samples** despite Pulse continuing to deliver them. The exact subcomponent is unknown — it could be the libavformat input thread's buffer accounting, libmp3lame's encoder state machine, or the mp3 muxer's I/O context.
-
-Whatever the internal state is, it's:
-- Triggered by total audio time, not file size or wall-clock duration
-- Probabilistic — same code can capture 44 min on one run and 7 min on another
-- Reproducible enough that every recent test in the fleet hit it
-- Impossible to defeat from outside ffmpeg (parec on the same source keeps reading fine)
-
-## The fix
-
-`bots/bot_controller/screen_and_audio_recorder.py` — switch ffmpeg from a single output to the segment muxer:
+### 6. Segment muxer (partial fix — moved cap, didn't eliminate it)
+Theory: per-output-context cap. Each new ffmpeg output via `-f segment` should reset libavformat/libmp3lame internal state.
 
 ```python
 ffmpeg_cmd = [
     "ffmpeg", "-y", "-thread_queue_size", "4096",
     "-f", "alsa", "-i", "default",
     "-c:a", "libmp3lame", "-b:a", "192k", "-ar", "44100", "-ac", "1",
-    "-f", "segment",
-    "-segment_time", str(segment_seconds),  # 240s default, env-configurable
-    "-segment_format", "mp3",
-    "-reset_timestamps", "1",
-    "-strftime", "0",
+    "-f", "segment", "-segment_time", "240",
+    "-segment_format", "mp3", "-reset_timestamps", "1",
     f"{base}_part_%04d{ext}",
 ]
 ```
 
-Each segment is an entirely fresh muxer + libmp3lame context. The internal state that triggers the cap accumulates per-output and resets at every rotation. With `-segment_time 240` (4 min, conservatively under the 7m 27s minimum observed cap), no single output ever runs long enough to fire the cap.
+Plus bytewise concat in `_concatenate_segments()` after ffmpeg exits.
 
-After ffmpeg exits in `stop_recording`, the new `_concatenate_segments()` method does a bytewise concatenation of the parts into the original `self.file_location`. CBR mp3 frames are independent — concatenation produces a valid mp3 that downstream code (HTTP upload, GCS storage, Gemini correction) sees as a single file.
+**Result:** moved the cap from 7m 27s → ~10 min. **Three independent runs (bots 113, 114, 115) all stopped at exactly ~13.9 MB / 9m 38s of audio.** Bot 115 was a real morning standup that ran 53 min wall-clock — we lost ~43 min of meeting audio. Segment rotation reset the *output* state but the cap is in the **shared input/demuxer state** across the entire ffmpeg process, not per-output.
 
-**Configurable via `RECORDING_SEGMENT_SECONDS` env var** (default 240).
+## Root cause
 
-## Validation — bot 113
+**ffmpeg's audio-side libavformat input pipeline hits a per-process cap somewhere around 10 min of consumed audio**, while Pulse continues to deliver samples. The cap is shared across all output segments (so segment muxer can't escape it). The exact subcomponent is unknown — likely the libavformat ALSA/Pulse demuxer's internal buffer accounting or thread state.
 
-Test meeting on 2026-05-01:
+Properties:
+- Per-process — multiple output rotations don't reset it
+- Triggered by total audio time consumed, not wall clock or file size
+- Probabilistic — same code captured 44 min on bot 101 once
+- Impossible to defeat from outside ffmpeg (parec on the same Pulse source keeps delivering at 92 KB/s while ffmpeg's mp3 freezes)
 
+## The actual fix — replace ffmpeg with `parec | lame`
+
+`bots/bot_controller/screen_and_audio_recorder.py` audio-only path now bypasses ffmpeg entirely:
+
+```python
+parec_cmd = [
+    "parec", "--device=auto_null.monitor", "--raw",
+    "--rate=44100", "--channels=1", "--format=s16le",
+]
+lame_cmd = [
+    "lame", "-r", "--bitwidth", "16", "--signed", "--little-endian",
+    "-s", "44.1", "-m", "m", "-b", "192", "--quiet",
+    "-", self.file_location,
+]
+self._parec_proc = subprocess.Popen(parec_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+self._lame_proc = subprocess.Popen(lame_cmd, stdin=self._parec_proc.stdout,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+self._parec_proc.stdout.close()  # so SIGPIPE flows correctly on shutdown
 ```
-01:04:02  Bot dispatched, ffmpeg starts with -f segment -segment_time 240
-01:08:02  part_0000.mp3 closed (5,764,746 bytes — full 4 min segment)
-01:12:02  part_0001.mp3 closed (5,763,492 bytes)
-01:14:05  Last audio (user ended meeting at t+603s)
-01:18:32  Last isSilent=False from Teams CC
-01:28:33  silence_timeout fires (10 min after last audio)
-01:28:48  ffmpeg SIGKILL (existing 15s safety)
-01:28:48  Concatenated 3 segments (13,887,534 bytes) into /tmp/bot_xxx-rec_yyy.mp3   ⭐
-01:28:50  HTTP upload begins
-01:28:51  HTTP file upload finished + Recording file saved
-01:28:51  forcing BOT_LEFT_MEETING (existing post-processing fix)
-01:28:53  Pod exit 0
+
+- **parec** is the diagnostic that proved Pulse delivers audio indefinitely. Single-purpose Pulse client, ~6 MB RSS, no buffering state of its own.
+- **lame** is a 25-year-old standalone mp3 encoder reading raw PCM from stdin. No libavformat. No demuxer state to corrupt.
+
+Shutdown ordering matters: terminate parec first → its socket close sends EOF to lame → lame writes the trailing mp3 frames + footer and exits cleanly. We give lame 10s to finalize on EOF before SIGTERM, then 5s before SIGKILL.
+
+The video path (`audio_only=False`, mp4 with x11grab) is **unchanged** and still uses ffmpeg.
+
+## Validation
+
+Two consecutive long-meeting runs on `parec-lame-20260430`:
+
+| Bot | Wall-clock | Recording duration | Final size | Result |
+|---|---|---|---|---|
+| 116 | ~20 min | **20 min 13 sec** | 27.8 MB | ✅ matches meeting |
+| 117 | ~24 min | **23 min 42 sec** | 32.6 MB | ✅ matches meeting |
+
+ffprobe of bot 117's mp3:
+```
+duration = 1422.27 sec  (23 min 42 sec — was capped at 9m 38s before)
+size     = 34,136,188
+bit_rate = 192,009  ✓ CBR mp3, perfect
 ```
 
-ffprobe of the resulting mp3:
+AUDIO_DIAG progression for bot 117 (linear growth, no stalls):
 ```
-duration = 578.62 sec  (9 min 38 sec — past the 7m 27s cap by 2+ min)
-size     = 13,887,534
-bit_rate = 192,009
+t+ 480s  size= 11,517,952  growing=True   ⭐ past 7.5min ffmpeg cap
+t+ 600s  size= 14,401,536  growing=True   🎯 past 10min segment-muxer cap
+t+ 690s  size= 16,560,128  growing=True
+t+1000s+ size> 25,000,000  growing=True
+t+1410s  size= 33,845,248  growing=True   ← bot stayed past meeting end
 ```
 
-Audio is real throughout (volumedetect -57 dB to -61 dB mean — quiet test, but consistent levels with no zero-volume padding past the old cap).
+Cleanup chain:
+```
+Auto-leaving meeting because there was no audio for 600 seconds
+parec stopped
+Stopped audio capture pipeline (parec | lame) → /tmp/bot_xxx-rec_yyy.mp3
+Uploading recording via HTTP POST to bot-scheduler
+HTTP file upload finished
+Recording file saved event recorded in DB
+forcing BOT_LEFT_MEETING (existing post-processing fix)
+Pod exit 0
+```
 
-Bot-scheduler downstream:
-- Document row inserted in `neusis_platform.documents`
-- Audio at `gs://neusis-platform-files/project_holding-area/original-sources/meetings/test-8-20260430-182851.mp3`
-- Markdown at `gs://neusis-platform-files/project_holding-area/extracted/meetings/test-8-20260430-182851.md`
+Bot-scheduler downstream completed normally on both runs — Gemini correction, document row, GCS audio + markdown all written.
 
 ## Operational notes
 
 ### What changed in production
-- All 3 deployments (`attendee-web`, `attendee-worker`, `attendee-scheduler`) on image `segment-muxer-20260430`
-- `CUBER_RELEASE_VERSION` secret bumped to match (so future bot pods inherit)
+- All 3 deployments (`attendee-web`, `attendee-worker`, `attendee-scheduler`) on image `parec-lame-20260430`
+- `CUBER_RELEASE_VERSION` secret bumped so future bot pods inherit
+- Dockerfile installs `lame` package alongside `pulseaudio-utils` (which provides `parec`)
 - Configmap unchanged
-- Bot-scheduler unchanged (zero downstream changes needed — it still receives one mp3 per meeting at the same endpoint)
+- **Bot-scheduler unchanged** — zero downstream changes. It still receives one mp3 per meeting at the same endpoint.
 
 ### What stayed in place
-- The `AUDIO_DIAG` daemon thread (purely observability — useful if a future regression appears)
-- The `parec` sidecar (also observability, ~89 KB/s of /dev/null write — negligible cost)
-- All earlier fixes from this branch:
-  - `46b0dfcb` — ffmpeg shutdown timeout
+- The `AUDIO_DIAG` daemon thread — now tracks `self.file_location` size + parec/lame process state; useful tripwire for any future regression
+- All earlier fixes on this branch:
+  - `46b0dfcb` — ffmpeg shutdown timeout (still relevant for video path)
   - `0309f2e1` — force `LEAVING → POST_PROCESSING` transition
-
-### Tuning `RECORDING_SEGMENT_SECONDS`
-Default 240s. The observed cap floor is 7m 27s (~447s) but this is variable; we've seen 16 min and 44 min on different runs of the same code. **240s gives ~3× safety margin against the worst observed cap.** If you want even more headroom, lower it (e.g. `RECORDING_SEGMENT_SECONDS=180`); cost is one extra rotation every meeting and a few more part files to concatenate.
+  - `eea49066` — `module-suspend-on-idle` unload in entrypoint.sh (harmless and stays)
+- HTTPFileUploader and GCSFileUploader unchanged
+- Cleanup chain order unchanged
 
 ### Failure modes — what happens if…
 
 | Scenario | Outcome |
 |---|---|
-| Pod is SIGKILLed mid-segment by Kubernetes | Already-closed segments are on disk; the open segment is incomplete. **Worst-case audio loss: ≤ 4 min** (the active segment). All earlier segments are valid mp3s and can be replayed manually. |
-| Concat step fails | Logged but doesn't crash cleanup. The original `self.file_location` won't exist, so `recording_file_saved()` won't fire — bot-scheduler won't get an mp3 for that bot. Manual recovery: `cat parts/* > final.mp3` and POST to `/api/recordings/upload`. |
-| Disk fills up mid-meeting | Segment writes fail; ffmpeg may exit. Ephemeral storage on bot pod is 10 GiB requested → ~70 hours of mp3 audio worth of headroom, won't realistically happen. |
-| Bot-scheduler is down at upload time | HTTP upload retries 3× then falls back to native GCS uploader (existing behavior); recording lands in `gs://attendee-recordings-neusis-platform/` for manual replay. |
+| Pod is SIGKILLed mid-meeting by Kubernetes | The mp3 file on disk is whatever lame had finalized up to the point of kill. mp3 frames are independently decodable, so even a partial file is playable from start to where it was cut. **Worst-case audio loss: the last few hundred ms** (lame's internal frame buffer). |
+| parec dies mid-meeting | lame sees EOF on stdin, finalizes the mp3 cleanly. `check_process_health` reports unhealthy and bot is force-left by the orchestration layer. Recording up to that point is preserved. |
+| lame dies mid-meeting | parec writes to a closed pipe, gets SIGPIPE, exits. Recording stops; whatever lame already wrote is on disk. Same recovery as above. |
+| Disk fills up | lame's write fails, lame exits. Bot pod has 10 GiB ephemeral storage = ~70 hours of mp3 — won't realistically happen for any meeting. |
+| Bot-scheduler is down at upload time | HTTP upload retries 3× then falls back to native GCS uploader. Recording lands in `gs://attendee-recordings-neusis-platform/` for manual replay. |
+| Cloud Run 32 MiB cap (huge recordings) | The existing GCS-notification mode in `http_file_uploader.py` handles files >30 MB. A 4-hour mp3 at 192 kbps is ~340 MB and will use that path automatically. |
 
-## What was NOT changed
+### Why this change is small
 
-- ffmpeg input form (`-f alsa -i default`) — same as bot 101
-- PulseAudio configuration in `entrypoint.sh` (the `module-suspend-on-idle` unload from `eea49066` is harmless and stays)
-- HTTPFileUploader / GCSFileUploader behavior
-- Cleanup chain order
-- Bot-scheduler API contract or schema
-- The `bot_recording_parts`-table architecture I drafted earlier — turned out to be unnecessary because in-pod concat works fine and the resulting single mp3 is small enough to fit Cloud Run's 32 MiB cap for typical meetings (~30 min @ 192 kbps = ~43 MB; for longer ones the existing GCS-notification mode in `http_file_uploader.py` handles it)
+The audio-only ffmpeg invocation was 18 lines. The parec | lame replacement is 25 lines. We deleted segment-muxer (45 lines), `_concatenate_segments` (28 lines), and the parec sidecar diagnostic (40 lines). **Net diff: -195 / +125** — the file is shorter and simpler than before the investigation started.
 
 ## Quick references
 
 | File | What |
 |---|---|
-| `bots/bot_controller/screen_and_audio_recorder.py` | Segment muxer + `_concatenate_segments()` + `AUDIO_DIAG` |
-| `entrypoint.sh` | Unload `module-suspend-on-idle` after Pulse start |
-| `bots/bot_controller/bot_controller.py:690+` | Force `LEAVING → POST_PROCESSING` |
+| `Dockerfile` | Adds `lame` to the apt-get install line for pulseaudio-utils |
+| `bots/bot_controller/screen_and_audio_recorder.py` | parec | lame pipeline + `AUDIO_DIAG` tripwire + parec/lame-aware `check_process_health` |
+| `entrypoint.sh` | Unload `module-suspend-on-idle` after Pulse start (kept from earlier experiment) |
+| `bots/bot_controller/bot_controller.py:~690` | Force `LEAVING → POST_PROCESSING` on cleanup |
 | `bots/bot_controller/http_file_uploader.py` | GCS-notification mode for files >30 MB |
 
 ## Things to look for in future regressions
@@ -174,8 +202,11 @@ Default 240s. The observed cap floor is 7m 27s (~447s) but this is variable; we'
 If recordings ever truncate again, the `AUDIO_DIAG` lines tell you immediately where:
 
 ```
-AUDIO_DIAG t+...s size=N growing=False stalled_for=...s | parec=running parec_growing=True | ...
+AUDIO_DIAG t+...s size=N growing=False stalled_for=...s | parec=running | lame=running
 ```
 
-- `parec_growing=True` while size frozen → ffmpeg internal cap (the bug we hit). Reduce `RECORDING_SEGMENT_SECONDS` if it's now happening at a shorter duration.
-- `parec_growing=False` together with size frozen → upstream stopped (Chrome / Pulse). Different bug class entirely; check sink-input state in the diag line.
+- **`growing=False` while parec=running and lame=running** — bug is back somehow. Check whether one of the pipe ends has stalled (lame's stderr may have errors).
+- **`lame=exited_rc=N`** — lame crashed. Check stderr; could be malformed input (parec format mismatch) or disk issue.
+- **`parec=exited_rc=N`** — parec crashed. Pulse server may have died or socket was severed.
+
+The video path (`audio_only=False`, mp4 with x11grab) still uses ffmpeg and is **NOT** affected by this fix. If long-form video recordings start truncating, that's a different code path and the parec | lame approach doesn't apply directly to it (parec is audio-only). The video path would need its own segment-muxer or process-rotation strategy at that point.
