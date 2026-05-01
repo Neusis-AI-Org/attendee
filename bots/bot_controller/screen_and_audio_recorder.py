@@ -25,28 +25,36 @@ class ScreenAndAudioRecorder:
         logger.info(f"Starting screen recorder for display {display_var} with dimensions {self.screen_dimensions} and file location {self.file_location}")
 
         if self.audio_only:
-            # FFmpeg command for audio-only recording to MP3.
-            # Reverted to the exact form bot 101 used (which captured 44 min),
-            # paired with disabling Pulse's module-suspend-on-idle in entrypoint.sh.
-            # See bot-flow-architecture.md for the truncation investigation.
+            # FFmpeg's audio capture pipeline has a probabilistic ~7.5 min cap
+            # that cannot be defeated from outside ffmpeg (verified via parec
+            # sidecar — Pulse keeps delivering audio while ffmpeg stops consuming).
+            # We use the segment muxer to rotate output every SEGMENT_SECONDS;
+            # each segment opens a fresh muxer/encoder context, resetting whatever
+            # internal state triggers the cap. After ffmpeg exits in stop_recording,
+            # the segments are concatenated back into self.file_location so the
+            # rest of the pipeline (upload, etc.) sees one mp3 as before.
+            base, ext = os.path.splitext(self.file_location)
+            self._segment_pattern = f"{base}_part_%04d{ext}"
+            self._segment_glob_prefix = f"{base}_part_"
+            self._segment_ext = ext
+            segment_seconds = int(os.environ.get("RECORDING_SEGMENT_SECONDS", "240"))
+            self._segment_seconds = segment_seconds
             ffmpeg_cmd = [
                 "ffmpeg",
-                "-y",  # Overwrite output file without asking
-                "-thread_queue_size",
-                "4096",
-                "-f",
-                "alsa",  # ALSA input (configured via ~/.asoundrc to use pulse)
-                "-i",
-                "default",  # Default ALSA device
-                "-c:a",
-                "libmp3lame",  # MP3 codec
-                "-b:a",
-                "192k",  # Audio bitrate (192 kbps for good quality)
-                "-ar",
-                "44100",  # Sample rate
-                "-ac",
-                "1",  # Mono
-                self.file_location,
+                "-y",
+                "-thread_queue_size", "4096",
+                "-f", "alsa",
+                "-i", "default",
+                "-c:a", "libmp3lame",
+                "-b:a", "192k",
+                "-ar", "44100",
+                "-ac", "1",
+                "-f", "segment",
+                "-segment_time", str(segment_seconds),
+                "-segment_format", "mp3",
+                "-reset_timestamps", "1",
+                "-strftime", "0",
+                self._segment_pattern,
             ]
         else:
             ffmpeg_cmd = ["ffmpeg", "-y", "-thread_queue_size", "256", "-framerate", "30", "-video_size", f"{self.screen_dimensions[0]}x{self.screen_dimensions[1]}", "-f", "x11grab", "-draw_mouse", "0", "-probesize", "32", "-i", display_var, "-thread_queue_size", "4096", "-f", "alsa", "-i", "default", "-vf", f"crop={self.recording_dimensions[0]}:{self.recording_dimensions[1]}:10:10", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30", "-c:a", "aac", "-strict", "experimental", "-b:a", "128k", self.file_location]
@@ -138,6 +146,17 @@ class ScreenAndAudioRecorder:
 
         return True
 
+    def _current_recording_size(self):
+        """Sum of all on-disk segment files (they're written sequentially)."""
+        import glob
+        try:
+            if self.audio_only and getattr(self, "_segment_glob_prefix", None):
+                parts = sorted(glob.glob(f"{self._segment_glob_prefix}*{self._segment_ext}"))
+                return sum(os.path.getsize(p) for p in parts) if parts else 0
+            return os.path.getsize(self.file_location) if os.path.exists(self.file_location) else -1
+        except Exception:
+            return -1
+
     def _audio_pipeline_diagnostic_loop(self):
         last_size = -1
         last_growth_at = time.time()
@@ -146,7 +165,7 @@ class ScreenAndAudioRecorder:
         last_parec_growth_at = time.time()
         while not self._diag_stop.wait(30):
             try:
-                size = os.path.getsize(self.file_location) if os.path.exists(self.file_location) else -1
+                size = self._current_recording_size()
                 growing = size > last_size
                 if growing:
                     last_growth_at = time.time()
@@ -259,6 +278,40 @@ class ScreenAndAudioRecorder:
                 pass
         self.ffmpeg_proc = None
         logger.info(f"Stopped screen and audio recorder for display with dimensions {self.screen_dimensions} and file location {self.file_location}")
+
+        # If we recorded as segments, concatenate them into self.file_location so
+        # the rest of the pipeline (upload, recording_file_saved, etc.) finds a
+        # single mp3 at the expected path.
+        if self.audio_only and getattr(self, "_segment_glob_prefix", None):
+            self._concatenate_segments()
+
+    def _concatenate_segments(self):
+        import glob
+        parts = sorted(glob.glob(f"{self._segment_glob_prefix}*{self._segment_ext}"))
+        if not parts:
+            logger.warning("No segment files found to concatenate; recording is empty")
+            return
+        try:
+            total_bytes = 0
+            with open(self.file_location, "wb") as out:
+                for p in parts:
+                    sz = os.path.getsize(p)
+                    total_bytes += sz
+                    with open(p, "rb") as inp:
+                        # mp3 frames are independent — concatenated CBR mp3 is a valid mp3
+                        while True:
+                            chunk = inp.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+            logger.info(f"Concatenated {len(parts)} segments ({total_bytes} bytes) into {self.file_location}")
+            for p in parts:
+                try:
+                    os.remove(p)
+                except Exception as e:
+                    logger.warning(f"Failed to remove segment {p}: {e}")
+        except Exception:
+            logger.exception("Failed to concatenate recording segments")
 
     def get_seekable_path(self, path):
         """
