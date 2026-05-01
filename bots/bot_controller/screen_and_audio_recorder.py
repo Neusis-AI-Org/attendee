@@ -19,74 +19,60 @@ class ScreenAndAudioRecorder:
         self.xterm_proc = None
         self._diag_thread = None
         self._diag_stop = threading.Event()
+        # Audio-only path uses parec | lame instead of ffmpeg to bypass ffmpeg's
+        # ~10 min input-side cap. See docs/gcp-deployment/audio-truncation-fix.md.
         self._parec_proc = None
+        self._lame_proc = None
 
     def start_recording(self, display_var):
         logger.info(f"Starting screen recorder for display {display_var} with dimensions {self.screen_dimensions} and file location {self.file_location}")
 
         if self.audio_only:
-            # FFmpeg's audio capture pipeline has a probabilistic ~7.5 min cap
-            # that cannot be defeated from outside ffmpeg (verified via parec
-            # sidecar — Pulse keeps delivering audio while ffmpeg stops consuming).
-            # We use the segment muxer to rotate output every SEGMENT_SECONDS;
-            # each segment opens a fresh muxer/encoder context, resetting whatever
-            # internal state triggers the cap. After ffmpeg exits in stop_recording,
-            # the segments are concatenated back into self.file_location so the
-            # rest of the pipeline (upload, etc.) sees one mp3 as before.
-            base, ext = os.path.splitext(self.file_location)
-            self._segment_pattern = f"{base}_part_%04d{ext}"
-            self._segment_glob_prefix = f"{base}_part_"
-            self._segment_ext = ext
-            segment_seconds = int(os.environ.get("RECORDING_SEGMENT_SECONDS", "240"))
-            self._segment_seconds = segment_seconds
-            ffmpeg_cmd = [
-                "ffmpeg",
-                "-y",
-                "-thread_queue_size", "4096",
-                "-f", "alsa",
-                "-i", "default",
-                "-c:a", "libmp3lame",
-                "-b:a", "192k",
-                "-ar", "44100",
-                "-ac", "1",
-                "-f", "segment",
-                "-segment_time", str(segment_seconds),
-                "-segment_format", "mp3",
-                "-reset_timestamps", "1",
-                "-strftime", "0",
-                self._segment_pattern,
+            # Bypass ffmpeg entirely for audio capture. ffmpeg's libavformat
+            # input-side state hits a ~10 min cap that segment muxer rotation
+            # cannot defeat. parec is a tiny Pulse client that we already
+            # verified runs unbounded; lame is a standalone mp3 encoder that
+            # reads raw PCM from stdin. Together they form a much simpler
+            # pipeline with none of ffmpeg's internal state to corrupt.
+            #
+            #   parec --device=auto_null.monitor --raw ... | lame -r ... - <out.mp3>
+            parec_cmd = [
+                "parec",
+                "--device=auto_null.monitor",
+                "--raw",
+                "--rate=44100",
+                "--channels=1",
+                "--format=s16le",
             ]
+            lame_cmd = [
+                "lame",
+                "-r",  # raw PCM input
+                "--bitwidth", "16",
+                "--signed",
+                "--little-endian",
+                "-s", "44.1",  # sample rate (kHz)
+                "-m", "m",     # mono
+                "-b", "192",   # bitrate
+                "--quiet",
+                "-",
+                self.file_location,
+            ]
+            logger.info(f"Starting audio capture pipeline: {' '.join(parec_cmd)} | {' '.join(lame_cmd)}")
+            self._parec_proc = subprocess.Popen(parec_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self._lame_proc = subprocess.Popen(lame_cmd, stdin=self._parec_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            # Close parent's reference to parec's stdout pipe so lame's exit
+            # propagates SIGPIPE to parec correctly on shutdown.
+            self._parec_proc.stdout.close()
+            # ffmpeg_proc stays None for audio-only; check_process_health is keyed on it
+            # but the pause/resume path uses pactl set-sink-mute which works the same way.
+            self.ffmpeg_proc = None
         else:
             ffmpeg_cmd = ["ffmpeg", "-y", "-thread_queue_size", "256", "-framerate", "30", "-video_size", f"{self.screen_dimensions[0]}x{self.screen_dimensions[1]}", "-f", "x11grab", "-draw_mouse", "0", "-probesize", "32", "-i", display_var, "-thread_queue_size", "4096", "-f", "alsa", "-i", "default", "-vf", f"crop={self.recording_dimensions[0]}:{self.recording_dimensions[1]}:10:10", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30", "-c:a", "aac", "-strict", "experimental", "-b:a", "128k", self.file_location]
+            logger.info(f"Starting FFmpeg command: {' '.join(ffmpeg_cmd)}")
+            self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-        logger.info(f"Starting FFmpeg command: {' '.join(ffmpeg_cmd)}")
-        self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-        # Sidecar parec reader on the same Pulse source. Independent of ffmpeg —
-        # if it ALSO stops at ~7.5 min the cap is upstream of ffmpeg (Chrome / Pulse).
-        # If it keeps reading while ffmpeg's mp3 freezes, the cap is inside ffmpeg.
-        # Output goes to /dev/null; we sample bytes-read via /proc/<pid>/io.rchar.
-        if self.audio_only:
-            try:
-                self._parec_proc = subprocess.Popen(
-                    [
-                        "parec",
-                        "--device=auto_null.monitor",
-                        "--raw",
-                        "--rate=44100",
-                        "--channels=1",
-                        "--format=s16le",
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                logger.info(f"Started parec sidecar pid={self._parec_proc.pid} for upstream-vs-ffmpeg comparison")
-            except Exception as e:
-                logger.warning(f"Could not start parec sidecar: {e}")
-                self._parec_proc = None
-
-        # Diagnostic thread: every 30s, log file growth + PulseAudio pipeline state.
-        # This is read-only — used to localize where audio capture stops on long meetings.
+        # Diagnostic thread: every 30s, log file growth so a future regression is
+        # immediately visible (the thread that found the original ffmpeg cap).
         self._diag_stop.clear()
         self._diag_thread = threading.Thread(target=self._audio_pipeline_diagnostic_loop, daemon=True)
         self._diag_thread.start()
@@ -127,13 +113,24 @@ class ScreenAndAudioRecorder:
             return False
 
     def check_process_health(self):
-        """Check if the FFmpeg process is still alive. Returns True if healthy, False if dead."""
-        if not self.ffmpeg_proc:
-            return True  # No process to check (recording not started or already stopped)
+        """Check if the recording process(es) are alive. Audio-only uses
+        parec | lame; video uses ffmpeg. Returns True if healthy, False if dead."""
+        # Audio-only path: both parec and lame must be alive
+        if self._parec_proc is not None or self._lame_proc is not None:
+            for name, proc in (("parec", self._parec_proc), ("lame", self._lame_proc)):
+                if proc is None:
+                    continue
+                rc = proc.poll()
+                if rc is not None:
+                    logger.error(f"{name} process exited unexpectedly with return code {rc}")
+                    return False
+            return True
 
+        # Video path: ffmpeg
+        if not self.ffmpeg_proc:
+            return True  # not started or already stopped
         returncode = self.ffmpeg_proc.poll()
         if returncode is not None:
-            # FFmpeg has exited unexpectedly
             stderr_output = ""
             if self.ffmpeg_proc.stderr:
                 try:
@@ -143,175 +140,104 @@ class ScreenAndAudioRecorder:
             logger.error(f"FFmpeg process exited unexpectedly with return code {returncode}. stderr: {stderr_output}")
             self.ffmpeg_proc = None
             return False
-
         return True
 
-    def _current_recording_size(self):
-        """Sum of all on-disk segment files (they're written sequentially)."""
-        import glob
-        try:
-            if self.audio_only and getattr(self, "_segment_glob_prefix", None):
-                parts = sorted(glob.glob(f"{self._segment_glob_prefix}*{self._segment_ext}"))
-                return sum(os.path.getsize(p) for p in parts) if parts else 0
-            return os.path.getsize(self.file_location) if os.path.exists(self.file_location) else -1
-        except Exception:
-            return -1
-
     def _audio_pipeline_diagnostic_loop(self):
+        """Every 30s, log file growth so a future regression in audio capture is
+        immediately visible in pod logs. This is the diagnostic that found the
+        original ffmpeg ~10 min cap; keeping it as a tripwire."""
         last_size = -1
         last_growth_at = time.time()
         started_at = time.time()
-        last_parec_rchar = -1
-        last_parec_growth_at = time.time()
         while not self._diag_stop.wait(30):
             try:
-                size = self._current_recording_size()
+                size = os.path.getsize(self.file_location) if os.path.exists(self.file_location) else -1
                 growing = size > last_size
                 if growing:
                     last_growth_at = time.time()
                 stalled_for = int(time.time() - last_growth_at) if not growing else 0
                 elapsed = int(time.time() - started_at)
 
-                # Sidecar parec process — tracks whether Pulse is still delivering
-                # samples to ANYONE on the same source. If parec keeps reading while
-                # ffmpeg's mp3 freezes, the bug is inside ffmpeg.
-                parec_rchar = -1
-                parec_growing = "n/a"
-                parec_stalled = 0
                 parec_alive = "no_proc"
                 if self._parec_proc is not None:
-                    if self._parec_proc.poll() is None:
-                        parec_alive = "running"
-                        try:
-                            # Track wchar: parec reads audio from a Pulse socket and writes
-                            # it to stdout (/dev/null). Socket reads don't count in rchar,
-                            # but the write side does — wchar is the real audio-flow signal.
-                            with open(f"/proc/{self._parec_proc.pid}/io") as f:
-                                for line in f:
-                                    if line.startswith("wchar:"):
-                                        parec_rchar = int(line.split()[1])
-                                        break
-                            if parec_rchar > last_parec_rchar:
-                                parec_growing = "True"
-                                last_parec_growth_at = time.time()
-                            else:
-                                parec_growing = "False"
-                            parec_stalled = int(time.time() - last_parec_growth_at) if parec_growing == "False" else 0
-                            last_parec_rchar = parec_rchar
-                        except Exception as e:
-                            parec_alive = f"io_err:{e}"
-                    else:
-                        parec_alive = f"exited_rc={self._parec_proc.returncode}"
-
-                def pactl(args, timeout=3):
-                    try:
-                        out = subprocess.check_output(["pactl"] + args, stderr=subprocess.STDOUT, timeout=timeout)
-                        return out.decode("utf-8", "replace").strip()
-                    except Exception as e:
-                        return f"<pactl error: {e}>"
-
-                sink_inputs = pactl(["list", "short", "sink-inputs"])  # Chrome -> auto_null
-                source_outputs = pactl(["list", "short", "source-outputs"])  # ffmpeg + parec <- auto_null.monitor
-                sinks = pactl(["list", "short", "sinks"])
-
-                # Look for "CORKED" / "SUSPENDED" markers in the long form for sink-inputs
-                sink_input_full = pactl(["list", "sink-inputs"])
-                corked = "Corked: yes" in sink_input_full
-                suspended_marker = "RUNNING" not in (pactl(["list", "sinks"]) or "")
+                    parec_alive = "running" if self._parec_proc.poll() is None else f"exited_rc={self._parec_proc.returncode}"
+                lame_alive = "no_proc"
+                if self._lame_proc is not None:
+                    lame_alive = "running" if self._lame_proc.poll() is None else f"exited_rc={self._lame_proc.returncode}"
 
                 logger.info(
-                    "AUDIO_DIAG t+%ds size=%d growing=%s stalled_for=%ds | parec=%s rchar=%d parec_growing=%s parec_stalled=%ds | corked=%s sink_running=%s | sink_inputs=[%s] | source_outputs=[%s] | sinks=[%s]",
-                    elapsed,
-                    size,
-                    growing,
-                    stalled_for,
-                    parec_alive,
-                    parec_rchar,
-                    parec_growing,
-                    parec_stalled,
-                    corked,
-                    not suspended_marker,
-                    sink_inputs.replace("\n", " | "),
-                    source_outputs.replace("\n", " | "),
-                    sinks.replace("\n", " | "),
+                    "AUDIO_DIAG t+%ds size=%d growing=%s stalled_for=%ds | parec=%s | lame=%s",
+                    elapsed, size, growing, stalled_for, parec_alive, lame_alive,
                 )
                 last_size = size
             except Exception:
                 logger.exception("AUDIO_DIAG loop error")
 
     def stop_recording(self):
-        if not self.ffmpeg_proc:
+        if not (self.ffmpeg_proc or self._lame_proc or self._parec_proc):
             return
-        # Stop diagnostic thread first so it doesn't race with ffmpeg shutdown
+        # Stop diagnostic thread first so it doesn't race with shutdown
         self._diag_stop.set()
         if self._diag_thread and self._diag_thread.is_alive():
             self._diag_thread.join(timeout=2)
-        # Stop parec sidecar (read-only, just for diagnostics)
-        if self._parec_proc and self._parec_proc.poll() is None:
+
+        # Audio-only path: shut down parec first so lame sees EOF on stdin and
+        # finalizes the mp3 cleanly. lame's own SIGTERM also works but EOF gives
+        # the cleanest mp3 frame closure.
+        if self._parec_proc is not None:
             try:
                 self._parec_proc.terminate()
-                self._parec_proc.wait(timeout=3)
+                self._parec_proc.wait(timeout=5)
             except Exception:
                 try: self._parec_proc.kill()
                 except Exception: pass
+            logger.info("parec stopped")
             self._parec_proc = None
-        # ffmpeg can block in an uninterruptible ALSA read syscall and ignore SIGTERM.
-        # Without a timeout this would hang cleanup() indefinitely and the pod would
-        # be SIGKILLed before the recording is uploaded.
-        self.ffmpeg_proc.terminate()
-        try:
-            self.ffmpeg_proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            logger.warning("FFmpeg did not exit within 15s of SIGTERM, sending SIGKILL")
-            self.ffmpeg_proc.kill()
+        if self._lame_proc is not None:
             try:
-                self.ffmpeg_proc.wait(timeout=5)
+                # lame should exit on EOF from parec; give it a moment then SIGTERM if still alive
+                self._lame_proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                logger.error("FFmpeg did not exit within 5s of SIGKILL — abandoning")
-        # Log any FFmpeg output on normal shutdown
-        if self.ffmpeg_proc.stderr:
-            try:
-                stderr_output = self.ffmpeg_proc.stderr.read().decode("utf-8", errors="replace")
-                if stderr_output.strip():
-                    logger.info(f"FFmpeg stderr on shutdown: {stderr_output[-2000:]}")
-            except Exception:
-                pass
-        self.ffmpeg_proc = None
-        logger.info(f"Stopped screen and audio recorder for display with dimensions {self.screen_dimensions} and file location {self.file_location}")
-
-        # If we recorded as segments, concatenate them into self.file_location so
-        # the rest of the pipeline (upload, recording_file_saved, etc.) finds a
-        # single mp3 at the expected path.
-        if self.audio_only and getattr(self, "_segment_glob_prefix", None):
-            self._concatenate_segments()
-
-    def _concatenate_segments(self):
-        import glob
-        parts = sorted(glob.glob(f"{self._segment_glob_prefix}*{self._segment_ext}"))
-        if not parts:
-            logger.warning("No segment files found to concatenate; recording is empty")
-            return
-        try:
-            total_bytes = 0
-            with open(self.file_location, "wb") as out:
-                for p in parts:
-                    sz = os.path.getsize(p)
-                    total_bytes += sz
-                    with open(p, "rb") as inp:
-                        # mp3 frames are independent — concatenated CBR mp3 is a valid mp3
-                        while True:
-                            chunk = inp.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            out.write(chunk)
-            logger.info(f"Concatenated {len(parts)} segments ({total_bytes} bytes) into {self.file_location}")
-            for p in parts:
+                logger.warning("lame did not exit on EOF within 10s, sending SIGTERM")
+                self._lame_proc.terminate()
                 try:
-                    os.remove(p)
-                except Exception as e:
-                    logger.warning(f"Failed to remove segment {p}: {e}")
-        except Exception:
-            logger.exception("Failed to concatenate recording segments")
+                    self._lame_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.warning("lame did not exit on SIGTERM, sending SIGKILL")
+                    self._lame_proc.kill()
+            if self._lame_proc.stderr:
+                try:
+                    stderr_output = self._lame_proc.stderr.read().decode("utf-8", errors="replace")
+                    if stderr_output.strip():
+                        logger.info(f"lame stderr on shutdown: {stderr_output[-2000:]}")
+                except Exception:
+                    pass
+            self._lame_proc = None
+            logger.info(f"Stopped audio capture pipeline (parec | lame) → {self.file_location}")
+
+        # Video path: ffmpeg can block in an uninterruptible ALSA read syscall and
+        # ignore SIGTERM. Without a timeout this would hang cleanup() indefinitely
+        # and the pod would be SIGKILLed before the recording is uploaded.
+        if self.ffmpeg_proc is not None:
+            self.ffmpeg_proc.terminate()
+            try:
+                self.ffmpeg_proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                logger.warning("FFmpeg did not exit within 15s of SIGTERM, sending SIGKILL")
+                self.ffmpeg_proc.kill()
+                try:
+                    self.ffmpeg_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.error("FFmpeg did not exit within 5s of SIGKILL — abandoning")
+            if self.ffmpeg_proc.stderr:
+                try:
+                    stderr_output = self.ffmpeg_proc.stderr.read().decode("utf-8", errors="replace")
+                    if stderr_output.strip():
+                        logger.info(f"FFmpeg stderr on shutdown: {stderr_output[-2000:]}")
+                except Exception:
+                    pass
+            self.ffmpeg_proc = None
+            logger.info(f"Stopped screen and audio recorder for display with dimensions {self.screen_dimensions} and file location {self.file_location}")
 
     def get_seekable_path(self, path):
         """

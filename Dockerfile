@@ -71,8 +71,12 @@ RUN CHROME_VERSION=$(google-chrome --version | sed 's/Google Chrome //' | sed 's
 # Install ALSA
 RUN apt-get update && apt-get install -y libasound2 libasound2-plugins alsa alsa-utils alsa-oss
 
-# Install Pulseaudio
-RUN apt-get install -y  pulseaudio pulseaudio-utils ffmpeg
+# Install Pulseaudio + lame.
+# `lame` is the standalone mp3 encoder used by the audio-only path to bypass
+# ffmpeg, which was silently truncating recordings at ~10 min (see
+# docs/gcp-deployment/audio-truncation-fix.md). The pipeline becomes:
+#   parec --device=auto_null.monitor --raw ... | lame -r ... - output.mp3
+RUN apt-get install -y  pulseaudio pulseaudio-utils ffmpeg lame
 
 # Install Linux Kernel Dev
 RUN apt-get update && apt-get install -y linux-libc-dev
