@@ -1,0 +1,48 @@
+name: Sync from upstream
+on:
+  schedule:
+    - cron: '0 6 * * 1'    # Mondays 06:00 UTC
+  workflow_dispatch:        # manual trigger button
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name  "neusis-sync-bot"
+          git config user.email "sync-bot@neusis.ai"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/attendee-labs/attendee.git
+          git fetch upstream main
+
+      - name: Create sync branch and merge
+        id: sync
+        run: |
+          BRANCH="sync/upstream-$(date +%Y-%m-%d)"
+          git checkout -b "$BRANCH" main
+          git merge upstream/main --no-edit -m "Merge upstream main $(date +%Y-%m-%d)" || true
+          if git diff --quiet origin/main HEAD 2>/dev/null; then
+            echo "Nothing to sync."
+            echo "branch=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          git push origin HEAD
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Open PR
+        if: steps.sync.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create --base main --head "${{ steps.sync.outputs.branch }}" \
+            --title "Sync from upstream — $(date +%Y-%m-%d)" \
+            --body "Automated weekly merge from attendee-labs/attendee:main. CI must pass before merge. See CHANGELOG-NEUSIS.md for any local customizations to watch for."
