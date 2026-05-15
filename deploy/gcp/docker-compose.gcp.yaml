@@ -1,0 +1,160 @@
+# Production overlay for the GCE single-VM deployment described in
+# deploy/gcp/install.md. Brings up: web (gunicorn), worker (celery,
+# concurrency=1), scheduler (celery beat), postgres, redis, caddy (TLS),
+# and a daily recording-cleanup cron.
+#
+# Usage from /opt/attendee on the VM:
+#   docker compose -f deploy/gcp/docker-compose.gcp.yaml --env-file .env up -d --build
+#
+# All values that vary per deployment are read from .env (see install.md
+# for the full env matrix). DO NOT inline secrets here.
+
+services:
+  # Single image build, shared by all attendee-* services. Same pattern as
+  # dev.docker-compose.yaml — only the runtime command differs per service.
+  attendee-app:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: attendee-prod:latest
+    restart: unless-stopped
+    networks:
+      - attendee_network
+    # Bind to localhost only; Caddy fronts public traffic. Django admin is
+    # therefore only reachable via SSH port-forward.
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - ../../.env
+    environment:
+      - DJANGO_SETTINGS_MODULE=attendee.settings.production
+      - POSTGRES_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: gunicorn attendee.wsgi --bind 0.0.0.0:8000 --workers 2 --timeout 120
+
+  attendee-worker:
+    image: attendee-prod:latest
+    restart: unless-stopped
+    networks:
+      - attendee_network
+    env_file:
+      - ../../.env
+    environment:
+      - DJANGO_SETTINGS_MODULE=attendee.settings.production
+      - POSTGRES_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+      # Bot Chrome runs in this container; sandbox disabled so it works inside
+      # an unprivileged Docker container. Same pattern as the dev compose.
+      - ENABLE_CHROME_SANDBOX=false
+    volumes:
+      # Recording artifacts live on the host so the cleanup cron + manual
+      # inspection can reach them outside the container.
+      - recordings:/recordings
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      attendee-app:
+        condition: service_started
+    # --concurrency=1 enforces single-bot-at-a-time per V1 spec. Bumping
+    # this is how we scale to N concurrent bots later.
+    command: celery -A attendee worker -l INFO --concurrency=1
+
+  attendee-scheduler:
+    image: attendee-prod:latest
+    restart: unless-stopped
+    networks:
+      - attendee_network
+    env_file:
+      - ../../.env
+    environment:
+      - DJANGO_SETTINGS_MODULE=attendee.settings.production
+      - POSTGRES_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      attendee-app:
+        condition: service_started
+    command: python manage.py run_scheduler
+
+  postgres:
+    image: postgres:15.3-alpine
+    restart: unless-stopped
+    networks:
+      - attendee_network
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-attendee_production}
+      POSTGRES_USER: ${POSTGRES_USER:-attendee}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?must be set in .env}
+      PGDATA: /data/postgres
+    volumes:
+      - postgres:/data/postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-attendee} -d ${POSTGRES_DB:-attendee_production}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks:
+      - attendee_network
+    volumes:
+      - redis:/data
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    networks:
+      - attendee_network
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      - APP_DOMAIN=${APP_DOMAIN:?must be set in .env}
+      - ACME_EMAIL=${ACME_EMAIL:?must be set in .env}
+    depends_on:
+      - attendee-app
+
+  # Daily cron — keeps the last 5 days of recordings on disk, deletes older
+  # ones. Self-contained Alpine + busybox cron + small wrapper script.
+  recording-cleanup:
+    image: alpine:3.19
+    restart: unless-stopped
+    networks:
+      - attendee_network
+    volumes:
+      - recordings:/recordings
+      - ./recording-cleanup.sh:/usr/local/bin/recording-cleanup.sh:ro
+    environment:
+      - RECORDING_RETENTION_DAYS=${RECORDING_RETENTION_DAYS:-5}
+    command: |
+      sh -c '
+        echo "0 3 * * * /usr/local/bin/recording-cleanup.sh >> /proc/1/fd/1 2>&1" | crontab -
+        crond -f -L /proc/1/fd/1
+      '
+
+networks:
+  attendee_network:
+    driver: bridge
+
+volumes:
+  postgres:
+  redis:
+  recordings:
+  caddy_data:
+  caddy_config:

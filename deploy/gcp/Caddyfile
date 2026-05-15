@@ -1,0 +1,41 @@
+# Caddy reverse-proxy + auto Let's Encrypt for the GCE Attendee deployment.
+# APP_DOMAIN and ACME_EMAIL are injected via the compose `environment:`
+# block (see docker-compose.gcp.yaml). Caddy supports env var substitution
+# with the {$VAR} syntax.
+
+{
+	email {$ACME_EMAIL}
+	# Production ACME endpoint is the default; uncomment the next line to
+	# test against the staging endpoint and avoid Let's Encrypt rate limits
+	# during initial deployment iteration.
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+{$APP_DOMAIN} {
+	encode gzip
+
+	# Forward everything to the Django app. Django requires
+	# X-Forwarded-Proto=https to honor SECURE_SSL_REDIRECT and emit
+	# secure cookies — Caddy adds this by default when proxying TLS.
+	reverse_proxy attendee-app:8000 {
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto https
+	}
+
+	# Block direct access to the Django admin from the public internet.
+	# Operators reach it via SSH port-forward to localhost:8000 instead.
+	@admin path /admin /admin/*
+	respond @admin "Not Found" 404
+
+	# Standard hardening headers. Add CSP / HSTS here once the app's
+	# resource graph is finalised.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Remove the Server header so Caddy doesn't advertise itself.
+		-Server
+	}
+}
