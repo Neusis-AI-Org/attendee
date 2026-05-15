@@ -586,6 +586,10 @@ class WebBotAdapter(BotAdapter):
     def add_subclass_specific_chrome_options(self, options):
         pass
 
+    # By default, we want to disable GPU
+    def subclass_specific_use_disable_gpu_chrome_option(self):
+        return True
+
     def init_driver(self):
         self.write_chrome_policies_file()
 
@@ -597,7 +601,8 @@ class WebBotAdapter(BotAdapter):
         options.add_argument(f"--window-size={self.video_frame_size[0]},{self.video_frame_size[1]}")
         options.add_argument("--start-fullscreen")
         # options.add_argument('--headless=new')
-        options.add_argument("--disable-gpu")
+        if self.subclass_specific_use_disable_gpu_chrome_option():
+            options.add_argument("--disable-gpu")
         options.add_argument("--disable-extensions")
         options.add_argument("--disable-application-cache")
         options.add_argument("--disable-dev-shm-usage")
