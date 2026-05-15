@@ -1915,6 +1915,9 @@ class ReceiverManager {
     }
 
     pollReceivers() {
+        const speakingParticipantIds = new Set();
+        const currentTime = Date.now();
+
         for (const [receiver, isActive] of this.receiverMap) {
             const contributingSources = receiver.getContributingSources();
 
@@ -1930,24 +1933,23 @@ class ReceiverManager {
             if (!isActive)
                 continue;
 
-            const currentTime = Date.now();
-            const recentContributingSources = contributingSources.filter(contributingSource => currentTime - contributingSource.timestamp <= 50);
-            const speakingParticipantIds = window.callManager?.getSpeakingParticipantIds(recentContributingSources) || [];
-
-            for (const speakingParticipantId of speakingParticipantIds) {
-                if (!this.participantSpeakingStateMachineMap.has(speakingParticipantId)) {
-                    this.participantSpeakingStateMachineMap.set(speakingParticipantId, new ParticipantSpeakingStateMachine(speakingParticipantId));
-                }
-            }
-
-            // Now iterate through the participantSpeakingStateMachineMap and update the isSpeaking state for each participant
-            for (const [participantId, participantSpeakingStateMachine] of this.participantSpeakingStateMachineMap) {
-                participantSpeakingStateMachine.addSample({
-                    isSpeaking: speakingParticipantIds.has(participantId),
-                    timestamp: currentTime
+            if (receiver.track?.readyState === 'ended') {
+                this.receiverMap.set(receiver, false);
+                window.ws?.sendJson({
+                    type: 'ReceiverManagerUpdate',
+                    update: "setReceiverInactive",
+                    receiverTrackId: receiver.track?.id
                 });
+                continue;
             }
-            
+
+            const recentContributingSources = contributingSources.filter(contributingSource => currentTime - contributingSource.timestamp <= 50);
+            const receiverSpeakingParticipantIds = window.callManager?.getSpeakingParticipantIds(recentContributingSources) || [];
+
+            for (const speakingParticipantId of receiverSpeakingParticipantIds) {
+                speakingParticipantIds.add(speakingParticipantId);
+            }
+
             /*
             {
     "rtpTimestamp": 506968569,
@@ -1955,6 +1957,20 @@ class ReceiverManager {
     "timestamp": 1759288487277
 }
             */
+        }
+
+        for (const speakingParticipantId of speakingParticipantIds) {
+            if (!this.participantSpeakingStateMachineMap.has(speakingParticipantId)) {
+                this.participantSpeakingStateMachineMap.set(speakingParticipantId, new ParticipantSpeakingStateMachine(speakingParticipantId));
+            }
+        }
+
+        // Now iterate through the participantSpeakingStateMachineMap and update the isSpeaking state for each participant
+        for (const [participantId, participantSpeakingStateMachine] of this.participantSpeakingStateMachineMap) {
+            participantSpeakingStateMachine.addSample({
+                isSpeaking: speakingParticipantIds.has(participantId),
+                timestamp: currentTime
+            });
         }
     }
 
