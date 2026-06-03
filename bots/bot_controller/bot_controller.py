@@ -10,6 +10,7 @@ from datetime import timedelta
 
 import gi
 import redis
+import requests
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.utils import timezone
@@ -548,6 +549,14 @@ class BotController:
         if not self.bot_in_db.external_media_storage_bucket_name():
             return
 
+        # If the signed-URL upload path is also configured, it wins. Avoids
+        # uploading the MP4 twice when a PB client sends both fields during a
+        # transition. The signed-URL function runs first and is idempotent if
+        # already done.
+        if self.bot_in_db.recording_upload_url():
+            logger.info(f"Skipping external-media-storage upload — signed-URL upload is configured for bot {self.bot_in_db.id}")
+            return
+
         external_media_storage_credentials_record = self.bot_in_db.project.credentials.filter(credential_type=Credentials.CredentialTypes.EXTERNAL_MEDIA_STORAGE).first()
         if not external_media_storage_credentials_record:
             logger.error(f"No external media storage credentials found for bot {self.bot_in_db.id}")
@@ -573,6 +582,35 @@ class BotController:
             logger.info(f"File uploader finished uploading file to external media storage bucket {self.bot_in_db.external_media_storage_bucket_name()}")
         except Exception as e:
             logger.exception(f"Error uploading recording to external media storage bucket {self.bot_in_db.external_media_storage_bucket_name()}: {e}")
+
+    def upload_recording_via_signed_url_if_enabled(self):
+        upload_url = self.bot_in_db.recording_upload_url()
+        if not upload_url:
+            return
+
+        recording_path = self.get_recording_file_location()
+        content_type = self.bot_in_db.recording_upload_content_type()
+        try:
+            logger.info(f"Uploading recording to signed URL for bot {self.bot_in_db.id}")
+            # Stream the file to avoid loading the whole MP4 into memory. The
+            # signed URL is the only authority — no credentials, no S3 protocol.
+            # Timeout sized for multi-GB uploads on slow links.
+            with open(recording_path, "rb") as f:
+                response = requests.put(
+                    upload_url,
+                    data=f,
+                    headers={"Content-Type": content_type},
+                    timeout=3600,
+                )
+            if not response.ok:
+                logger.error(
+                    f"Signed-URL upload failed for bot {self.bot_in_db.id}: HTTP {response.status_code} "
+                    f"body[:200]={response.text[:200]!r}"
+                )
+                return
+            logger.info(f"Signed-URL upload completed for bot {self.bot_in_db.id}")
+        except Exception as e:
+            logger.exception(f"Error uploading recording via signed URL for bot {self.bot_in_db.id}: {e}")
 
     def get_file_uploader(self):
         if settings.STORAGE_PROTOCOL == "azure":
@@ -646,6 +684,11 @@ class BotController:
             self.websocket_client_manager.cleanup()
 
         if self.get_recording_file_location():
+            # Optional PB-controlled signed-URL upload. Runs alongside the
+            # standard internal storage upload — it's an additional destination,
+            # not a replacement. Mutually exclusive with the legacy
+            # external_media_storage path (only one is configured per bot).
+            self.upload_recording_via_signed_url_if_enabled()
             self.upload_recording_to_external_media_storage_if_enabled()
 
             logger.info("Telling file uploader to upload recording file...")

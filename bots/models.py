@@ -1157,6 +1157,18 @@ class Bot(models.Model):
             external_media_storage_settings = {}
         return external_media_storage_settings.get("recording_file_name", None)
 
+    def recording_upload_url(self):
+        recording_upload_settings = self.settings.get("recording_upload_settings", {})
+        if recording_upload_settings is None:
+            recording_upload_settings = {}
+        return recording_upload_settings.get("upload_url", None)
+
+    def recording_upload_content_type(self):
+        recording_upload_settings = self.settings.get("recording_upload_settings", {})
+        if recording_upload_settings is None:
+            recording_upload_settings = {}
+        return recording_upload_settings.get("content_type", "video/mp4")
+
     def zoom_onbehalf_token_zoom_oauth_connection_user_id(self):
         return self.settings.get("zoom_settings", {}).get("onbehalf_token", {}).get("zoom_oauth_connection_user_id", None)
 

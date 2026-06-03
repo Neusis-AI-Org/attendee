@@ -1152,6 +1152,28 @@ class ExternalMediaStorageSettingsJSONField(serializers.JSONField):
     pass
 
 
+@extend_schema_field(
+    {
+        "type": "object",
+        "properties": {
+            "upload_url": {
+                "type": "string",
+                "pattern": "^https://.*",
+                "description": "Pre-signed HTTP PUT URL. The bot streams the final MP4 to this URL at end of recording. No credentials are stored on the bot side — the URL itself is the authority. Issuer (e.g. Project Brain) is responsible for the URL's TTL and target object path.",
+            },
+            "content_type": {
+                "type": "string",
+                "description": "Optional Content-Type header for the PUT. Defaults to video/mp4.",
+            },
+        },
+        "required": ["upload_url"],
+        "additionalProperties": False,
+    }
+)
+class RecordingUploadSettingsJSONField(serializers.JSONField):
+    pass
+
+
 class KubernetesSettingsJSONField(serializers.JSONField):
     pass
 
@@ -1215,6 +1237,12 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
 
     external_media_storage_settings = ExternalMediaStorageSettingsJSONField(
         help_text="Settings that allow Attendee to upload the recording to an external storage bucket controlled by you. This relieves you from needing to download the recording from Attendee and then upload it to your own storage. To use this feature you must add credentials to your project that provide access to the external storage.",
+        required=False,
+        default=None,
+    )
+
+    recording_upload_settings = RecordingUploadSettingsJSONField(
+        help_text="Pre-signed-URL upload for the final recording. When set, the bot HTTP PUTs the MP4 to upload_url at end of recording — no stored credentials, no S3-protocol coupling, works natively with GCS/S3/Azure signed URLs. Mutually exclusive with external_media_storage_settings (only one upload path runs per bot).",
         required=False,
         default=None,
     )
@@ -1308,6 +1336,32 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
 
         try:
             jsonschema.validate(instance=value, schema=self.EXTERNAL_MEDIA_STORAGE_SETTINGS_SCHEMA)
+        except jsonschema.exceptions.ValidationError as e:
+            raise serializers.ValidationError(e.message)
+
+        return value
+
+    RECORDING_UPLOAD_SETTINGS_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "upload_url": {
+                "type": "string",
+                "pattern": "^https://.*",
+            },
+            "content_type": {
+                "type": "string",
+            },
+        },
+        "required": ["upload_url"],
+        "additionalProperties": False,
+    }
+
+    def validate_recording_upload_settings(self, value):
+        if value is None:
+            return value
+
+        try:
+            jsonschema.validate(instance=value, schema=self.RECORDING_UPLOAD_SETTINGS_SCHEMA)
         except jsonschema.exceptions.ValidationError as e:
             raise serializers.ValidationError(e.message)
 
