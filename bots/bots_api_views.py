@@ -820,6 +820,7 @@ class TranscriptView(APIView):
                     "timestamp_ms": utterance.timestamp_ms,
                     "duration_ms": utterance.duration_ms,
                     "transcription": utterance.transcription,
+                    "source": utterance.source,
                 }
                 for utterance in utterances
                 if utterance.transcription.get("transcript", "")

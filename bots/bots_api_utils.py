@@ -242,13 +242,19 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
     webhook_subscriptions = serializer.validated_data["webhooks"]
     callback_settings = serializer.validated_data["callback_settings"]
     external_media_storage_settings = serializer.validated_data["external_media_storage_settings"]
+    recording_upload_settings = serializer.validated_data.get("recording_upload_settings")
     voice_agent_settings = serializer.validated_data["voice_agent_settings"]
     kubernetes_settings = serializer.validated_data["kubernetes_settings"]
     initial_state = BotStates.SCHEDULED if join_at else BotStates.READY
 
-    error = validate_external_media_storage_settings(external_media_storage_settings, project)
-    if error:
-        return None, error
+    # Skip the legacy EXTERNAL_MEDIA_STORAGE-credentials validator when the
+    # PB-signed-URL upload path is configured; recording_upload_settings is
+    # self-contained (the URL itself is the authority) and doesn't need a
+    # stored credential on the Attendee project.
+    if not recording_upload_settings:
+        error = validate_external_media_storage_settings(external_media_storage_settings, project)
+        if error:
+            return None, error
 
     error = validate_bot_concurrency_limit(project)
     if error:
@@ -266,6 +272,7 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
         "websocket_settings": websocket_settings,
         "callback_settings": callback_settings,
         "external_media_storage_settings": external_media_storage_settings,
+        "recording_upload_settings": recording_upload_settings,
         "voice_agent_settings": voice_agent_settings,
         "kubernetes_settings": kubernetes_settings,
     }

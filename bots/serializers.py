@@ -1855,6 +1855,12 @@ class TranscriptUtteranceSerializer(serializers.Serializer):
     timestamp_ms = serializers.IntegerField()
     duration_ms = serializers.IntegerField()
     transcription = serializers.JSONField()
+    # `source` is the Utterance.Sources int — 1=PER_PARTICIPANT_AUDIO (audio
+    # chunks fed to an audio-shape provider like Whisper), 2=CLOSED_CAPTION_
+    # FROM_PLATFORM (Teams Live Captions, Meet captions, etc.). PB uses this
+    # to prefer Whisper but fall back to captions when Whisper returned
+    # nothing for a meeting.
+    source = serializers.IntegerField()
 
 
 @extend_schema_serializer(

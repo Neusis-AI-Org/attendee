@@ -38,6 +38,7 @@ def create_app_session(data: dict, source: BotCreationSource, project: Project) 
     recording_settings = serializer.validated_data["recording_settings"]
     debug_settings = serializer.validated_data["debug_settings"]
     external_media_storage_settings = serializer.validated_data["external_media_storage_settings"]
+    recording_upload_settings = serializer.validated_data.get("recording_upload_settings")
 
     metadata = serializer.validated_data["metadata"]
     websocket_settings = serializer.validated_data["websocket_settings"]
@@ -46,9 +47,12 @@ def create_app_session(data: dict, source: BotCreationSource, project: Project) 
     zoom_rtms = serializer.validated_data["zoom_rtms"]
     initial_state = BotStates.READY
 
-    error = validate_external_media_storage_settings(external_media_storage_settings, project)
-    if error:
-        return None, error
+    # See note in bots_api_utils.py — signed-URL upload path bypasses the
+    # legacy credential validator.
+    if not recording_upload_settings:
+        error = validate_external_media_storage_settings(external_media_storage_settings, project)
+        if error:
+            return None, error
 
     error = validate_bot_concurrency_limit(project)
     if error:
@@ -61,6 +65,7 @@ def create_app_session(data: dict, source: BotCreationSource, project: Project) 
         "debug_settings": debug_settings,
         "websocket_settings": websocket_settings,
         "external_media_storage_settings": external_media_storage_settings,
+        "recording_upload_settings": recording_upload_settings,
         "zoom_rtms": zoom_rtms,
     }
 

@@ -588,14 +588,48 @@ class BotController:
         if not upload_url:
             return
 
-        recording_path = self.get_recording_file_location()
+        mp4_path = self.get_recording_file_location()
         content_type = self.bot_in_db.recording_upload_content_type()
+
+        # When the caller asked for audio/mpeg (the default), strip the video
+        # track and re-encode to MP3 before uploading. The recording is captured
+        # as MP4 (screen + audio) for in-meeting fidelity, but the long-term
+        # GCS artifact is audio-only — ~70% smaller, sufficient for downstream
+        # transcription / human listen-back.
+        upload_path = mp4_path
+        cleanup_path: str | None = None
+        if content_type.startswith("audio/"):
+            mp3_path = mp4_path.rsplit(".", 1)[0] + ".mp3"
+            try:
+                import subprocess
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-i", mp4_path,
+                        "-vn",                       # drop video track
+                        "-acodec", "libmp3lame",
+                        "-b:a", "128k",
+                        "-y",                        # overwrite if exists
+                        mp3_path,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=600,
+                )
+                upload_path = mp3_path
+                cleanup_path = mp3_path
+                logger.info(f"Transcoded recording to MP3 for bot {self.bot_in_db.id}: {mp3_path}")
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                logger.exception(
+                    f"MP4 -> MP3 transcode failed for bot {self.bot_in_db.id}; "
+                    f"falling back to MP4 upload: {e}"
+                )
+
         try:
-            logger.info(f"Uploading recording to signed URL for bot {self.bot_in_db.id}")
-            # Stream the file to avoid loading the whole MP4 into memory. The
+            logger.info(f"Uploading recording to signed URL for bot {self.bot_in_db.id}: {upload_path}")
+            # Stream the file to avoid loading the whole audio into memory. The
             # signed URL is the only authority — no credentials, no S3 protocol.
-            # Timeout sized for multi-GB uploads on slow links.
-            with open(recording_path, "rb") as f:
+            with open(upload_path, "rb") as f:
                 response = requests.put(
                     upload_url,
                     data=f,
@@ -611,6 +645,13 @@ class BotController:
             logger.info(f"Signed-URL upload completed for bot {self.bot_in_db.id}")
         except Exception as e:
             logger.exception(f"Error uploading recording via signed URL for bot {self.bot_in_db.id}: {e}")
+        finally:
+            if cleanup_path:
+                try:
+                    import os
+                    os.remove(cleanup_path)
+                except OSError:
+                    pass
 
     def get_file_uploader(self):
         if settings.STORAGE_PROTOCOL == "azure":
