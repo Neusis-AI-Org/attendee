@@ -1,4 +1,5 @@
 import logging
+import os
 import queue
 import time
 from datetime import datetime, timedelta
@@ -7,6 +8,23 @@ import numpy as np
 import webrtcvad
 
 logger = logging.getLogger(__name__)
+
+# Normalized-RMS threshold below which a per-participant audio chunk is
+# treated as silence and dropped before VAD / upload. The default 0.01 was
+# calibrated against Zoom, where the bot SDK delivers each participant as a
+# clean, isolated track at normal voice levels. On Teams the same bot
+# receives audio at meaningfully lower per-participant levels (Teams either
+# mixes participants or delivers them at a quieter baseline depending on the
+# client), and at 0.01 most real speech ends up filtered as background noise
+# — production logs typically show ~70% of chunks dropped due to "rms being
+# small".
+#
+# Override per deployment via `RMS_SILENCE_THRESHOLD` in the worker env.
+# Reasonable values:
+#   0.010   upstream default (Zoom-only deployments)
+#   0.003   Teams + Zoom mix (still gates obvious silence)
+#   0.001   Teams-only / aggressive (lets more noise through to VAD)
+RMS_SILENCE_THRESHOLD = float(os.environ.get("RMS_SILENCE_THRESHOLD", "0.01"))
 
 
 def calculate_normalized_rms(audio_bytes):
@@ -95,7 +113,7 @@ class PerParticipantNonStreamingAudioInputManager:
         if rms_value == 0:
             self.diagnostic_info["total_chunks_marked_as_silent_due_to_rms_being_zero"] += 1
             return True
-        if rms_value < 0.01:
+        if rms_value < RMS_SILENCE_THRESHOLD:
             self.diagnostic_info["total_chunks_marked_as_silent_due_to_rms_being_small"] += 1
             return True
         if not self.is_speech(chunk_bytes):
