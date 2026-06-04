@@ -789,8 +789,18 @@ class TranscriptView(APIView):
                 if async_transcription.state != AsyncTranscriptionStates.COMPLETE:
                     return Response({"error": f"Async transcription {async_transcription.object_id} is not complete. It is in state {AsyncTranscriptionStates.state_to_api_code(async_transcription.state)}"}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Get all utterances with transcriptions, sorted by timeline
-            utterances_query = Utterance.objects.select_related("participant").filter(recording=recording, transcription__isnull=False, async_transcription=async_transcription)
+            # `include_empty=true` opt-in: also return utterance rows that
+            # have no transcription text yet (or no transcription column at
+            # all). Used by PB's batch-transcription flow to harvest the
+            # per-participant speech windows Attendee captured during the
+            # meeting and project speaker labels onto Whisper batch output
+            # without depending on Live Captions being on. Default behaviour
+            # (text-only) is unchanged for existing callers.
+            include_empty = request.query_params.get("include_empty") == "true"
+            base_qs = Utterance.objects.select_related("participant").filter(
+                recording=recording, async_transcription=async_transcription
+            )
+            utterances_query = base_qs if include_empty else base_qs.filter(transcription__isnull=False)
 
             # Apply updated_after filter if provided
             updated_after = request.query_params.get("updated_after")
@@ -810,21 +820,28 @@ class TranscriptView(APIView):
             # Apply ordering
             utterances = utterances_query.order_by("timestamp_ms")
 
-            # Format the response, skipping empty transcriptions
-            transcript_data = [
-                {
+            # Format the response. When `include_empty=true` is set, keep
+            # utterances with no/empty transcript so the caller can use
+            # them as speaker timing windows even when there's no text.
+            # Defensive: `transcription` may be NULL on rows that never
+            # reached process_utterance_task; render as an empty dict so
+            # the serializer's `transcription` JSONField stays happy.
+            transcript_data = []
+            for utterance in utterances:
+                transcription = utterance.transcription or {}
+                has_text = bool(transcription.get("transcript", ""))
+                if not include_empty and not has_text:
+                    continue
+                transcript_data.append({
                     "speaker_name": utterance.participant.full_name,
                     "speaker_uuid": utterance.participant.uuid,
                     "speaker_user_uuid": utterance.participant.user_uuid,
                     "speaker_is_host": utterance.participant.is_host,
                     "timestamp_ms": utterance.timestamp_ms,
                     "duration_ms": utterance.duration_ms,
-                    "transcription": utterance.transcription,
+                    "transcription": transcription,
                     "source": utterance.source,
-                }
-                for utterance in utterances
-                if utterance.transcription.get("transcript", "")
-            ]
+                })
 
             if request.query_params.get("split_on_turns") == "true":
                 transcript_data = split_utterances_on_turn_taking(transcript_data)
