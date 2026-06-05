@@ -44,6 +44,29 @@ pcm.!default { type pulse }
 ctl.!default { type pulse }
 EOF
 
+# ---- PulseAudio daemon.conf overrides ----
+# Chrome/Teams render audio at 48 kHz. PulseAudio's default is 44.1 kHz with
+# the speex-float-1 resampler (the lowest-quality option on its 1-10 scale).
+# Without these overrides every audio frame gets downsampled 48 → 44.1 with
+# a cheap resampler, then ffmpeg captures at 44.1 and the MP3 transcode
+# upsamples back to 48 — two unnecessary resampling passes that shave off
+# the upper end of the speech band and contribute to Whisper transcription
+# errors. Per-user daemon.conf is read on daemon start, so write it BEFORE
+# the pulseaudio invocation below.
+#
+# Setting default and alternate to the same rate means the sink never
+# auto-switches rate at stream connect time, so module-suspend-on-idle
+# can't bring it back at a different rate after a quiet stretch either.
+PULSE_CFG_DIR="${XDG_CONFIG_HOME:-$HOME_DIR/.config}/pulse"
+mkdir -p "$PULSE_CFG_DIR"
+cat > "$PULSE_CFG_DIR/daemon.conf" <<'EOF'
+default-sample-rate = 48000
+alternate-sample-rate = 48000
+default-sample-format = s16le
+default-sample-channels = 2
+resample-method = speex-float-5
+EOF
+
 if [[ "${PA_DEBUG:-0}" = "1" ]]; then
   echo "==== ENV ===="
   echo "USER=$(id -un) UID=$(id -u) GID=$(id -g)"
@@ -80,12 +103,30 @@ if [[ "${PA_DEBUG:-0}" = "1" ]]; then
   pactl list short sources || true
 fi
 
-# Prefer an existing null sink (auto_null), else just keep whatever default is
+# ---- Pre-load a named 48 kHz null sink ----
+# Replace the auto_null spawned by module-always-sink with an explicit
+# null sink that has a deterministic name, an explicit format that won't
+# get re-negotiated on resume, and a human-readable device description.
+# Chrome inspects the device description when choosing audio constraints;
+# a generic "Dummy Output" is the kind of device clients are most likely
+# to downgrade audio quality for. Idempotent — only loaded if not already
+# present.
 DEFAULT_SINK="$(pactl info | sed -n 's/^Default Sink: //p')"
 DEFAULT_SOURCE="$(pactl info | sed -n 's/^Default Source: //p')"
 
-# If there's an auto_null, set it explicitly (idempotent)
-if pactl list short sinks | awk '{print $2}' | grep -qx "auto_null"; then
+if ! pactl list short sinks | awk '{print $2}' | grep -qx "bot_sink"; then
+  pactl load-module module-null-sink \
+    sink_name=bot_sink \
+    rate=48000 channels=2 format=s16le \
+    sink_properties="device.description=Bot_Capture_Sink" >/dev/null || true
+fi
+
+# Prefer our named sink; if for any reason it didn't load, fall back to
+# auto_null (the previous behaviour).
+if pactl list short sinks | awk '{print $2}' | grep -qx "bot_sink"; then
+  pactl set-default-sink bot_sink || true
+  pactl set-default-source bot_sink.monitor || true
+elif pactl list short sinks | awk '{print $2}' | grep -qx "auto_null"; then
   pactl set-default-sink auto_null || true
   pactl set-default-source auto_null.monitor || true
 fi
