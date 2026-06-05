@@ -646,12 +646,35 @@ class BotController:
         except Exception as e:
             logger.exception(f"Error uploading recording via signed URL for bot {self.bot_in_db.id}: {e}")
         finally:
-            if cleanup_path:
-                try:
-                    import os
-                    os.remove(cleanup_path)
-                except OSError:
-                    pass
+            # Preserve the source MP4 and the transcoded MP3 to /recordings (the
+            # gcp_recordings docker volume, swept by the recording-cleanup
+            # container's 5-day retention). Previously the MP3 was deleted right
+            # after upload and the MP4 in /tmp was wiped on the next worker
+            # restart, leaving no way to post-mortem audio-truncation incidents.
+            # When /recordings isn't mounted (local dev, or a deployment that
+            # opted out), fall back to the old deletion path so /tmp doesn't
+            # fill up over time.
+            import os
+            import shutil
+            RECORDINGS_DIR = "/recordings"
+            preserved = os.path.isdir(RECORDINGS_DIR)
+            for src in (mp4_path, cleanup_path):
+                if not src or not os.path.exists(src):
+                    continue
+                if preserved:
+                    dst = os.path.join(RECORDINGS_DIR, os.path.basename(src))
+                    try:
+                        shutil.move(src, dst)
+                        logger.info(f"Preserved recording at {dst} for bot {self.bot_in_db.id}")
+                    except OSError as e:
+                        logger.warning(f"Failed to move {src} -> {dst}: {e}")
+                elif src == cleanup_path:
+                    # Only the transcoded MP3 was created by us; the MP4 came
+                    # from the recorder and its lifecycle is owned elsewhere.
+                    try:
+                        os.remove(src)
+                    except OSError:
+                        pass
 
     def get_file_uploader(self):
         if settings.STORAGE_PROTOCOL == "azure":

@@ -41,7 +41,25 @@ class ScreenAndAudioRecorder:
                 self.file_location,
             ]
         else:
-            ffmpeg_cmd = ["ffmpeg", "-y", "-thread_queue_size", "256", "-framerate", "30", "-video_size", f"{self.screen_dimensions[0]}x{self.screen_dimensions[1]}", "-f", "x11grab", "-draw_mouse", "0", "-probesize", "32", "-i", display_var, "-thread_queue_size", "4096", "-f", "alsa", "-i", "default", "-vf", f"crop={self.recording_dimensions[0]}:{self.recording_dimensions[1]}:10:10", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30", "-c:a", "aac", "-strict", "experimental", "-b:a", "128k", self.file_location]
+            # Two robustness flags added on top of the original screen+audio recipe:
+            #
+            #   -thread_queue_size 8192  (alsa input)
+            #     Doubled from 4096. The ALSA capture path is bursty; smaller
+            #     queues cause frame drops under transient CPU pressure, and a
+            #     dropped frame at the wrong moment causes the audio stream PTS
+            #     to fall behind the video stream's. FFmpeg then writes a short
+            #     audio track even though video kept running — producing the
+            #     "MP4 has 10 min of video but only 3 min of audio" pattern we
+            #     just hit on a 14-minute meeting.
+            #
+            #   -af aresample=async=1000
+            #     Audio-output filter that resamples the ALSA stream against
+            #     the muxer clock and inserts silence on underruns (up to 1000
+            #     samples/sec compensation). Without this, FFmpeg writes the
+            #     last received audio frame and stops; with it, missing audio
+            #     is padded so the audio track stays the same duration as the
+            #     video track.
+            ffmpeg_cmd = ["ffmpeg", "-y", "-thread_queue_size", "256", "-framerate", "30", "-video_size", f"{self.screen_dimensions[0]}x{self.screen_dimensions[1]}", "-f", "x11grab", "-draw_mouse", "0", "-probesize", "32", "-i", display_var, "-thread_queue_size", "8192", "-f", "alsa", "-i", "default", "-vf", f"crop={self.recording_dimensions[0]}:{self.recording_dimensions[1]}:10:10", "-af", "aresample=async=1000", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30", "-c:a", "aac", "-strict", "experimental", "-b:a", "128k", self.file_location]
 
         logger.info(f"Starting FFmpeg command: {' '.join(ffmpeg_cmd)}")
         self.ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
