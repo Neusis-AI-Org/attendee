@@ -88,9 +88,13 @@ class ScreenAndAudioRecorder:
         if self.audio_source == "alsa":
             # aresample=async=1000 compensates for ALSA underruns by padding
             # silence so the audio track stays the same duration as the video
-            # track. Pointless in pipe mode — the JS side doesn't underrun the
-            # same way and any drift there means we want to *see* it in the
-            # output, not have ffmpeg silently paper over it.
+            # track. Strictly an ALSA-specific patch — when we own the input
+            # stream (pipe mode), the JS-side ScriptProcessorNode in
+            # teams_chromedriver_payload.js delivers a steady cadence that
+            # ffmpeg's mp4 muxer is happy with on its own. Leaving aresample
+            # in for pipe mode caused subtle quality degradation under bursty
+            # delivery — the filter would stretch/compress audio in ways that
+            # accumulated over a long call.
             audio_filter = ["-af", "aresample=async=1000"]
 
         return [
@@ -214,9 +218,25 @@ class ScreenAndAudioRecorder:
                 )
 
     def _audio_writer_loop(self):
-        """Drain the audio queue into ffmpeg's stdin. Exits cleanly on the EOS
-        sentinel pushed by stop_recording, on ffmpeg exit, or on a BrokenPipe
-        (ffmpeg died on its own — let stop_recording handle reporting)."""
+        """Drain the audio queue into ffmpeg's stdin.
+
+        Pure pass-through — no silence injection. An earlier version of this
+        loop padded the pipe with silence whenever the queue went idle, on
+        the theory that ffmpeg's mp4 muxer would stall video too if it didn't
+        get a steady audio rhythm. That turned out to be wrong:
+        ScriptProcessorNode in teams_chromedriver_payload.js delivers buffers
+        at a steady ~42 ms cadence and ffmpeg's audio input thread is happy
+        to wait for them through the `-thread_queue_size 8192` buffer. The
+        silence-injection logic only ever produced audible stutter (silence
+        ticks interleaved with real audio at the buffer cadence). It's gone.
+
+        The case that *would* genuinely need padding — "JS chain dies and no
+        chunks arrive for many seconds" — is now prevented by Fix B: the
+        ScriptProcessorNode is hung off the AudioContext itself, not any
+        individual track, so it keeps emitting through SFU renegotiations.
+
+        Exits on the EOS sentinel from stop_recording, on ffmpeg exit, or on
+        BrokenPipe."""
         proc = self.ffmpeg_proc
         if proc is None or proc.stdin is None:
             return

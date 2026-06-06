@@ -253,93 +253,85 @@ const handleVideoTrackForRealTimePerParticipantVideo = async ({ track, streams }
     }
 
     async processMixedAudioTrack() {
+        // We previously tapped the mixed audio with a MediaStreamTrackProcessor
+        // bound to `this.mixedAudioTrack` (the track exposed by the AudioContext
+        // destination's MediaStream). That worked for short calls but broke on
+        // long ones: Teams renegotiates the SFU connection every few minutes
+        // and the underlying mixed track ended, completing the
+        // MediaStreamTrackProcessor's readable stream. After that the chain
+        // was permanently dead — we stopped emitting sendMixedAudio while the
+        // call continued for another N minutes. (Symptom: bot in call for
+        // 11 minutes, recording stops at 6:27.)
+        //
+        // Switch to a ScriptProcessorNode hung off the AudioContext itself.
+        // The node runs as long as the AudioContext is alive — independent of
+        // any individual track — so renegotiation events are invisible to us.
+        // ScriptProcessorNode is deprecated but still fully supported in
+        // Chrome, runs on the audio thread, and needs no separate worklet
+        // module. AudioWorkletNode is the modern replacement and we can swap
+        // to it later, but it's overkill for "give me each buffer of mixed
+        // audio".
+        if (this._mixedAudioScriptNode) {
+            console.log('Mixed audio processor already active, skipping');
+            return;
+        }
         try {
-            // Create processor to get raw audio frames from the mixed audio track
-            const processor = new MediaStreamTrackProcessor({ track: this.mixedAudioTrack });
-            const generator = new MediaStreamTrackGenerator({ kind: 'audio' });
+            // ~42 ms at 48 kHz. Power-of-two; balances per-callback overhead
+            // against added latency. Larger buffers reduce the
+            // call-rate but make individual gaps more noticeable.
+            const BUFFER_SIZE = 2048;
+            const scriptNode = this.audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
 
-            // Get readable stream of audio frames
-            const readable = processor.readable;
-            const writable = generator.writable;
+            scriptNode.onaudioprocess = (event) => {
+                try {
+                    const inputBuffer = event.inputBuffer;
+                    const numChannels = inputBuffer.numberOfChannels;
+                    const numSamples = inputBuffer.length;
+                    const audioData = new Float32Array(numSamples);
 
-            // Transform stream to intercept and send audio frames
-            const transformStream = new TransformStream({
-                async transform(frame, controller) {
-                    if (!frame) {
-                        return;
-                    }
-
-                    try {
-                        // Check if controller is still active
-                        if (controller.desiredSize === null) {
-                            frame.close();
-                            return;
-                        }
-
-                        // Copy the audio data
-                        const numChannels = frame.numberOfChannels;
-                        const numSamples = frame.numberOfFrames;
-                        const audioData = new Float32Array(numSamples);
-
-                        // Copy data from each channel
-                        // If multi-channel, average all channels together to create mono output
-                        if (numChannels > 1) {
-                            // Temporary buffer to hold each channel's data
-                            const channelData = new Float32Array(numSamples);
-
-                            // Sum all channels
-                            for (let channel = 0; channel < numChannels; channel++) {
-                                frame.copyTo(channelData, { planeIndex: channel });
-                                for (let i = 0; i < numSamples; i++) {
-                                    audioData[i] += channelData[i];
-                                }
-                            }
-
-                            // Average by dividing by number of channels
+                    // Same mono-mix logic as the old MediaStreamTrackProcessor
+                    // path — the wire format Python expects is mono Float32.
+                    if (numChannels > 1) {
+                        const channelData = new Float32Array(numSamples);
+                        for (let channel = 0; channel < numChannels; channel++) {
+                            inputBuffer.copyFromChannel(channelData, channel);
                             for (let i = 0; i < numSamples; i++) {
-                                audioData[i] /= numChannels;
+                                audioData[i] += channelData[i];
                             }
-                        } else {
-                            // If already mono, just copy the data
-                            frame.copyTo(audioData, { planeIndex: 0 });
                         }
-
-                        // Send mixed audio data via websocket
-                        const timestamp = performance.now();
-                        window.ws.sendMixedAudio(timestamp, audioData);
-
-                        // Pass through the original frame
-                        controller.enqueue(frame);
-                    } catch (error) {
-                        console.error('Error processing mixed audio frame:', error);
-                        frame.close();
+                        for (let i = 0; i < numSamples; i++) {
+                            audioData[i] /= numChannels;
+                        }
+                    } else {
+                        inputBuffer.copyFromChannel(audioData, 0);
                     }
-                },
-                flush() {
-                    console.log('Mixed audio transform stream flush called');
+
+                    const timestamp = performance.now();
+                    window.ws.sendMixedAudio(timestamp, audioData);
+                } catch (error) {
+                    console.error('Error processing mixed audio frame:', error);
                 }
+            };
+
+            // The script node needs a source feeding it AND a sink for the
+            // audio thread to actually pull samples through. The source is a
+            // MediaStreamSource on our destination stream (the mixer's
+            // output); the sink is the AudioContext's destination. The sink
+            // connection has no audible effect in Xvfb (no real speakers) but
+            // it's what drives the audio thread to call onaudioprocess.
+            const mixerOutSource = this.audioContext.createMediaStreamSource(this.destination.stream);
+            mixerOutSource.connect(scriptNode);
+            scriptNode.connect(this.audioContext.destination);
+
+            this._mixedAudioScriptNode = scriptNode;
+            this._mixedAudioMixerOutSource = mixerOutSource;
+
+            window.ws?.sendJson({
+                type: 'MixedAudioProcessorStarted',
+                mode: 'ScriptProcessorNode',
+                bufferSize: BUFFER_SIZE,
+                sampleRate: this.audioContext.sampleRate,
             });
-
-            // Create an abort controller for cleanup
-            const abortController = new AbortController();
-
-            try {
-                // Connect the streams
-                await readable
-                    .pipeThrough(transformStream)
-                    .pipeTo(writable, {
-                        signal: abortController.signal
-                    })
-                    .catch(error => {
-                        if (error.name !== 'AbortError') {
-                            console.error('Mixed audio pipeline error:', error);
-                        }
-                    });
-            } catch (error) {
-                console.error('Mixed audio stream pipeline error:', error);
-                abortController.abort();
-            }
-
         } catch (error) {
             console.error('Error setting up mixed audio processor:', error);
         }
