@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from dataclasses import asdict
+from datetime import timedelta
 
 from django.conf import settings
 
@@ -497,14 +498,37 @@ class BotValidationMixin:
         return normalized_url
 
     def validate_join_at(self, value):
-        """Validate that join_at cannot be in the past."""
+        """Validate join_at and snap to "now" when it's in the recent past.
+
+        A common race is: a calendar event starts at T, the calendar-sync
+        client polls at T+0.5s, and dispatches the bot with join_at=T —
+        already half a second behind. Rejecting that is unhelpful; the
+        intended behaviour is "join the call that just started". We accept
+        anything within JOIN_AT_PAST_GRACE_S of "now" and snap it forward so
+        downstream scheduling treats it as a present-time join.
+        """
         if value is None:
             return value
 
-        if value < timezone.now():
-            raise serializers.ValidationError("join_at cannot be in the past")
+        JOIN_AT_PAST_GRACE_S = 30 * 60  # 30 minutes
+        now = timezone.now()
 
-        if value > timezone.now() + relativedelta(years=3):
+        if value < now:
+            delta_s = (now - value).total_seconds()
+            if delta_s <= JOIN_AT_PAST_GRACE_S:
+                # Snap to a couple of seconds out so the scheduler sees a
+                # near-future join time, not a past one.
+                logger.info(
+                    f"validate_join_at: snapping join_at {value.isoformat()} "
+                    f"({delta_s:.1f}s in the past) forward to now+2s — within "
+                    f"the {JOIN_AT_PAST_GRACE_S}s grace window"
+                )
+                return now + timedelta(seconds=2)
+            raise serializers.ValidationError(
+                f"join_at cannot be in the past by more than {JOIN_AT_PAST_GRACE_S // 60} minutes"
+            )
+
+        if value > now + relativedelta(years=3):
             raise serializers.ValidationError("join_at cannot be more than 3 years in the future")
 
         return value
