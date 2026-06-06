@@ -600,6 +600,23 @@ class WebBotAdapter(BotAdapter):
         options.add_argument("--use-fake-ui-for-media-stream")
         options.add_argument(f"--window-size={self.video_frame_size[0]},{self.video_frame_size[1]}")
         options.add_argument("--start-fullscreen")
+        # Long-running headless Chrome tabs eventually get classified as
+        # background / occluded by the renderer process-priority heuristics,
+        # which then throttles the audio thread. Symptom is *exactly* what we
+        # saw on a 26-minute meeting: audio volume tails off from ~18 min,
+        # ScriptProcessorNode buffers stop arriving cleanly by ~19 min, the
+        # mp4 muxer stalls waiting on audio frames and stops writing video too
+        # — so the resulting recording capped at 19:52 of useful content out
+        # of 26 min of call. These three flags are the standard "stay
+        # foreground forever" set that Puppeteer/Playwright ship by default.
+        options.add_argument("--disable-background-timer-throttling")
+        options.add_argument("--disable-backgrounding-occluded-windows")
+        options.add_argument("--disable-renderer-backgrounding")
+        # Belt-and-suspenders: skip the native-window-occlusion check
+        # entirely. Without this Chrome can still decide the Xvfb window is
+        # occluded (it has no real compositor) and apply some throttling even
+        # when the three flags above tell it not to background the renderer.
+        options.add_argument("--disable-features=CalculateNativeWinOcclusion")
         # options.add_argument('--headless=new')
         if self.subclass_specific_use_disable_gpu_chrome_option():
             options.add_argument("--disable-gpu")
