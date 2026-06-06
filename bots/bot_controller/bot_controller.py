@@ -191,7 +191,7 @@ class BotController:
             meeting_url=self.bot_in_db.meeting_url,
             add_video_frame_callback=None,
             wants_any_video_frames_callback=None,
-            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if self.pipeline_configuration.websocket_stream_audio else None,
+            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if (self.pipeline_configuration.websocket_stream_audio or self._recording_uses_js_audio_input()) else None,
             add_per_participant_video_frame_callback=self.add_per_participant_video_frame_callback if self.pipeline_configuration.websocket_stream_per_participant_video else None,
             upsert_caption_callback=self.closed_caption_manager.upsert_caption if self.save_utterances_for_closed_captions() else None,
             upsert_chat_message_callback=self.on_new_chat_message,
@@ -242,7 +242,7 @@ class BotController:
             meeting_url=self.bot_in_db.meeting_url,
             add_video_frame_callback=None,
             wants_any_video_frames_callback=None,
-            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if self.pipeline_configuration.websocket_stream_audio else None,
+            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if (self.pipeline_configuration.websocket_stream_audio or self._recording_uses_js_audio_input()) else None,
             add_per_participant_video_frame_callback=self.add_per_participant_video_frame_callback if self.pipeline_configuration.websocket_stream_per_participant_video else None,
             upsert_caption_callback=self.closed_caption_manager.upsert_caption if self.save_utterances_for_closed_captions() else None,
             upsert_chat_message_callback=self.on_new_chat_message,
@@ -315,7 +315,7 @@ class BotController:
             meeting_url=self.bot_in_db.meeting_url,
             add_video_frame_callback=None,
             wants_any_video_frames_callback=None,
-            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if self.pipeline_configuration.websocket_stream_audio else None,
+            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if (self.pipeline_configuration.websocket_stream_audio or self._recording_uses_js_audio_input()) else None,
             add_per_participant_video_frame_callback=self.add_per_participant_video_frame_callback if self.pipeline_configuration.websocket_stream_per_participant_video else None,
             upsert_caption_callback=self.closed_caption_manager.upsert_caption if self.save_utterances_for_closed_captions() else None,
             upsert_chat_message_callback=self.on_new_chat_message,
@@ -407,6 +407,15 @@ class BotController:
     def add_mixed_audio_chunk_callback(self, chunk: bytes):
         if self.gstreamer_pipeline:
             self.gstreamer_pipeline.on_mixed_audio_raw_data_received_callback(chunk)
+
+        # When the recorder is in JS-audio mode (Teams / Meet web bots with
+        # RECORDING_AUDIO_FROM_JS=1), this is the path that delivers the
+        # recording's audio track. The bytes are already raw s16le mono PCM at
+        # mixed_audio_sample_rate() — same format the recorder told ffmpeg to
+        # expect on its stdin — so we forward verbatim. Falls through to the
+        # websocket-streaming path below when that's also configured.
+        if self.screen_and_audio_recorder is not None and self._recording_uses_js_audio_input():
+            self.screen_and_audio_recorder.write_audio_chunk(chunk)
 
         if not self.websocket_client_manager:
             return
@@ -885,6 +894,32 @@ class BotController:
     def should_create_websocket_client_manager(self):
         return self.pipeline_configuration.websocket_stream_audio or self.pipeline_configuration.websocket_stream_per_participant_audio or self.pipeline_configuration.websocket_stream_per_participant_video
 
+    def _recording_uses_js_audio_input(self):
+        """Whether the recording's audio track should come from the JS-captured
+        mixed-audio chunks (clean, 48 kHz, taken from the WebRTC tracks before
+        the browser's audio renderer / PulseAudio re-capture) rather than from
+        ALSA `default`.
+
+        Gated by the RECORDING_AUDIO_FROM_JS env var (off by default) so the
+        switchover is opt-in per deployment. Only applies to platforms where
+        the JS payload actually delivers mixed audio: Teams + Google Meet web
+        bots, and the Zoom web bot. Zoom native SDK and RTMS already use the
+        GstreamerPipeline path with raw streams and don't run the
+        screen_and_audio_recorder at all (see should_create_gstreamer_pipeline).
+        """
+        if os.environ.get("RECORDING_AUDIO_FROM_JS", "0") not in ("1", "true", "True"):
+            return False
+        if not self.should_create_screen_and_audio_recorder():
+            return False
+        meeting_type = self.get_meeting_type()
+        if meeting_type == MeetingTypes.TEAMS:
+            return True
+        if meeting_type == MeetingTypes.GOOGLE_MEET:
+            return True
+        if meeting_type == MeetingTypes.ZOOM and self.bot_in_db.use_zoom_web_adapter():
+            return True
+        return False
+
     def should_create_screen_and_audio_recorder(self):
         # if we're not recording audio or video and not doing rtmp streaming, then we don't need to create a screen and audio recorder
         if not self.pipeline_configuration.record_audio and not self.pipeline_configuration.record_video and not self.pipeline_configuration.rtmp_stream_audio and not self.pipeline_configuration.rtmp_stream_video:
@@ -976,10 +1011,13 @@ class BotController:
 
         self.screen_and_audio_recorder = None
         if self.should_create_screen_and_audio_recorder():
+            uses_js_audio = self._recording_uses_js_audio_input()
             self.screen_and_audio_recorder = ScreenAndAudioRecorder(
                 file_location=self.get_recording_file_location(),
                 recording_dimensions=self.bot_in_db.recording_dimensions(),
                 audio_only=not (self.pipeline_configuration.record_video or self.pipeline_configuration.rtmp_stream_video),
+                audio_source="pipe" if uses_js_audio else "alsa",
+                audio_sample_rate=self.mixed_audio_sample_rate() if uses_js_audio else 48000,
             )
 
         self.websocket_client_manager = None
