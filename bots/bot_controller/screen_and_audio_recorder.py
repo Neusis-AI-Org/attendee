@@ -3,6 +3,7 @@ import os
 import queue
 import subprocess
 import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -10,6 +11,16 @@ logger = logging.getLogger(__name__)
 # thread. Distinct from None so callers cannot accidentally trigger shutdown
 # by feeding a falsy chunk.
 _AUDIO_EOS = object()
+
+# How long the writer thread waits for a real chunk before filling the gap
+# with silence. The JS ScriptProcessorNode delivers buffers at
+# bufferSize / sampleRate = 2048 / 48000 ≈ 42.7 ms, so 200 ms is well above
+# the natural cadence — the silence branch never fires during normal flow.
+# It kicks in only when Chrome's audio rendering goes truly quiet (the
+# multi-second-to-multi-minute black holes we've been seeing on long Teams
+# calls), which keeps the ffmpeg pipe alive and the mp4 muxer advancing so
+# video doesn't get held back waiting for audio frames.
+_AUDIO_SILENCE_TICK_S = 0.2
 
 
 class ScreenAndAudioRecorder:
@@ -218,22 +229,26 @@ class ScreenAndAudioRecorder:
                 )
 
     def _audio_writer_loop(self):
-        """Drain the audio queue into ffmpeg's stdin.
+        """Drain the audio queue into ffmpeg's stdin, with gap-tolerant
+        silence injection.
 
-        Pure pass-through — no silence injection. An earlier version of this
-        loop padded the pipe with silence whenever the queue went idle, on
-        the theory that ffmpeg's mp4 muxer would stall video too if it didn't
-        get a steady audio rhythm. That turned out to be wrong:
-        ScriptProcessorNode in teams_chromedriver_payload.js delivers buffers
-        at a steady ~42 ms cadence and ffmpeg's audio input thread is happy
-        to wait for them through the `-thread_queue_size 8192` buffer. The
-        silence-injection logic only ever produced audible stutter (silence
-        ticks interleaved with real audio at the buffer cadence). It's gone.
+        Normal flow: ScriptProcessorNode delivers a 2048-sample buffer every
+        ~42 ms. The writer pulls it inside the 200 ms timeout, writes it, and
+        loops. The silence branch never fires.
 
-        The case that *would* genuinely need padding — "JS chain dies and no
-        chunks arrive for many seconds" — is now prevented by Fix B: the
-        ScriptProcessorNode is hung off the AudioContext itself, not any
-        individual track, so it keeps emitting through SFU renegotiations.
+        Quiet-Chrome flow: we've observed long Teams calls where Chrome's
+        audio rendering goes quiet for multi-second-to-multi-minute stretches
+        (test 4 = 18 min in, test 5 = 5 min in; cause not yet root-caused).
+        When that happens the queue runs dry, the writer's get() times out
+        after 200 ms, and we inject one tick of silence into stdin so ffmpeg
+        keeps writing. Without this, ffmpeg's mp4 muxer would stall waiting
+        for audio frames to interleave with video and both streams would stop
+        being written — producing the "audio file is 76% of wall clock"
+        truncation pattern.
+
+        Logs are gated so they don't spam on micro-jitter: only fires on the
+        first tick of any silence streak, every ~1 s of continuous silence,
+        and once on recovery when the streak was substantial.
 
         Exits on the EOS sentinel from stop_recording, on ffmpeg exit, or on
         BrokenPipe."""
@@ -241,9 +256,39 @@ class ScreenAndAudioRecorder:
         if proc is None or proc.stdin is None:
             return
         stdin = proc.stdin
+        # One tick of s16le mono silence at the configured sample rate.
+        # 48 kHz × 0.2 s × 2 bytes = 19,200 bytes for the Teams case.
+        silence_chunk = b"\x00" * (int(self.audio_sample_rate * _AUDIO_SILENCE_TICK_S) * 2)
+        next_tick = time.monotonic() + _AUDIO_SILENCE_TICK_S
+        silence_writes = 0
         try:
             while True:
-                item = self._audio_queue.get()
+                now = time.monotonic()
+                timeout = max(0.0, next_tick - now)
+                try:
+                    item = self._audio_queue.get(timeout=timeout)
+                except queue.Empty:
+                    # No real chunk arrived this tick. Inject silence so
+                    # the muxer keeps moving.
+                    try:
+                        stdin.write(silence_chunk)
+                    except BrokenPipeError:
+                        return
+                    except Exception as e:
+                        logger.warning(f"audio writer encountered error: {e}")
+                        return
+                    silence_writes += 1
+                    # Log on the first tick of a streak and roughly every
+                    # 1 s thereafter (1 s / 0.2 s tick = every 5 writes).
+                    if silence_writes == 1 or silence_writes % 5 == 0:
+                        logger.info(
+                            f"audio writer: injecting silence "
+                            f"({silence_writes * _AUDIO_SILENCE_TICK_S:.1f}s of dead air — "
+                            f"JS audio pipeline is quiet)"
+                        )
+                    next_tick = time.monotonic() + _AUDIO_SILENCE_TICK_S
+                    continue
+
                 if item is _AUDIO_EOS:
                     return
                 try:
@@ -254,6 +299,16 @@ class ScreenAndAudioRecorder:
                 except Exception as e:
                     logger.warning(f"audio writer encountered error: {e}")
                     return
+                # Real chunk written. If the previous streak was non-trivial
+                # (≥ 1 tick of silence), note the recovery so we can see in
+                # the logs how long the audio chain was dark.
+                if silence_writes >= 1:
+                    logger.info(
+                        f"audio writer: real audio resumed after "
+                        f"{silence_writes * _AUDIO_SILENCE_TICK_S:.1f}s of silence"
+                    )
+                silence_writes = 0
+                next_tick = time.monotonic() + _AUDIO_SILENCE_TICK_S
         finally:
             try:
                 stdin.close()
