@@ -253,83 +253,109 @@ const handleVideoTrackForRealTimePerParticipantVideo = async ({ track, streams }
     }
 
     async processMixedAudioTrack() {
-        // We previously tapped the mixed audio with a MediaStreamTrackProcessor
-        // bound to `this.mixedAudioTrack` (the track exposed by the AudioContext
-        // destination's MediaStream). That worked for short calls but broke on
-        // long ones: Teams renegotiates the SFU connection every few minutes
-        // and the underlying mixed track ended, completing the
-        // MediaStreamTrackProcessor's readable stream. After that the chain
-        // was permanently dead — we stopped emitting sendMixedAudio while the
-        // call continued for another N minutes. (Symptom: bot in call for
-        // 11 minutes, recording stops at 6:27.)
+        // History of this tap:
+        //   1. MediaStreamTrackProcessor bound to the mixer's output track.
+        //      Died when Teams renegotiated the SFU and the track ended.
+        //   2. ScriptProcessorNode hung off the AudioContext. Survived
+        //      renegotiation (it's tied to the context, not a track) but ran
+        //      on the *main thread*, so whenever Chrome's main thread got
+        //      busy (GC, layout, Teams' own JS) the audioprocess callback
+        //      fired late and delivered stale/zero samples — audio quality
+        //      degraded and stretches went silent on long calls.
         //
-        // Switch to a ScriptProcessorNode hung off the AudioContext itself.
-        // The node runs as long as the AudioContext is alive — independent of
-        // any individual track — so renegotiation events are invisible to us.
-        // ScriptProcessorNode is deprecated but still fully supported in
-        // Chrome, runs on the audio thread, and needs no separate worklet
-        // module. AudioWorkletNode is the modern replacement and we can swap
-        // to it later, but it's overkill for "give me each buffer of mixed
-        // audio".
-        if (this._mixedAudioScriptNode) {
+        // Now: AudioWorkletNode. The processor runs on the dedicated audio
+        // rendering thread with real-time scheduling, fully isolated from
+        // main-thread CPU pressure. It's tied to the AudioContext (so it
+        // survives SFU renegotiation like the ScriptProcessorNode did) AND
+        // it doesn't starve under main-thread load (fixing the quality
+        // problem). Frames are posted back to the main thread via the node's
+        // MessagePort, where we forward them over the websocket exactly as
+        // before — the wire format (mono Float32) is unchanged so Python
+        // doesn't change.
+        if (this._mixedAudioWorkletNode) {
             console.log('Mixed audio processor already active, skipping');
             return;
         }
         try {
-            // ~42 ms at 48 kHz. Power-of-two; balances per-callback overhead
-            // against added latency. Larger buffers reduce the
-            // call-rate but make individual gaps more noticeable.
-            const BUFFER_SIZE = 2048;
-            const scriptNode = this.audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
-
-            scriptNode.onaudioprocess = (event) => {
-                try {
-                    const inputBuffer = event.inputBuffer;
-                    const numChannels = inputBuffer.numberOfChannels;
-                    const numSamples = inputBuffer.length;
-                    const audioData = new Float32Array(numSamples);
-
-                    // Same mono-mix logic as the old MediaStreamTrackProcessor
-                    // path — the wire format Python expects is mono Float32.
-                    if (numChannels > 1) {
-                        const channelData = new Float32Array(numSamples);
-                        for (let channel = 0; channel < numChannels; channel++) {
-                            inputBuffer.copyFromChannel(channelData, channel);
-                            for (let i = 0; i < numSamples; i++) {
-                                audioData[i] += channelData[i];
+            // The worklet accumulates the audio thread's native 128-sample
+            // render quanta into FRAME_SIZE-sample blocks before posting, to
+            // keep the main-thread message rate sane. 2048 ≈ 42 ms at 48 kHz,
+            // matching the old ScriptProcessorNode buffer size.
+            const FRAME_SIZE = 2048;
+            const workletCode = `
+                class MixedAudioCapture extends AudioWorkletProcessor {
+                    constructor(options) {
+                        super();
+                        this.frameSize = options.processorOptions.frameSize;
+                        this.buffer = new Float32Array(this.frameSize);
+                        this.filled = 0;
+                    }
+                    process(inputs) {
+                        const input = inputs[0];
+                        if (!input || input.length === 0) {
+                            // No input connected this quantum — emit silence so
+                            // the downstream timeline keeps advancing.
+                            return true;
+                        }
+                        const numChannels = input.length;
+                        const numSamples = input[0].length;
+                        for (let i = 0; i < numSamples; i++) {
+                            let sample = 0;
+                            for (let c = 0; c < numChannels; c++) {
+                                sample += input[c][i];
+                            }
+                            sample /= numChannels;
+                            this.buffer[this.filled++] = sample;
+                            if (this.filled === this.frameSize) {
+                                // Transfer a copy so the worklet can keep
+                                // reusing its buffer without a data race.
+                                const out = this.buffer.slice(0);
+                                this.port.postMessage(out, [out.buffer]);
+                                this.filled = 0;
                             }
                         }
-                        for (let i = 0; i < numSamples; i++) {
-                            audioData[i] /= numChannels;
-                        }
-                    } else {
-                        inputBuffer.copyFromChannel(audioData, 0);
+                        return true;
                     }
+                }
+                registerProcessor('mixed-audio-capture', MixedAudioCapture);
+            `;
+            const blobUrl = URL.createObjectURL(
+                new Blob([workletCode], { type: 'application/javascript' })
+            );
+            await this.audioContext.audioWorklet.addModule(blobUrl);
+            URL.revokeObjectURL(blobUrl);
 
+            const workletNode = new AudioWorkletNode(this.audioContext, 'mixed-audio-capture', {
+                numberOfInputs: 1,
+                numberOfOutputs: 1,
+                channelCount: 1,
+                processorOptions: { frameSize: FRAME_SIZE },
+            });
+
+            workletNode.port.onmessage = (event) => {
+                try {
                     const timestamp = performance.now();
-                    window.ws.sendMixedAudio(timestamp, audioData);
+                    window.ws.sendMixedAudio(timestamp, event.data);
                 } catch (error) {
-                    console.error('Error processing mixed audio frame:', error);
+                    console.error('Error forwarding mixed audio frame:', error);
                 }
             };
 
-            // The script node needs a source feeding it AND a sink for the
-            // audio thread to actually pull samples through. The source is a
-            // MediaStreamSource on our destination stream (the mixer's
-            // output); the sink is the AudioContext's destination. The sink
-            // connection has no audible effect in Xvfb (no real speakers) but
-            // it's what drives the audio thread to call onaudioprocess.
+            // Source the mixer's output into the worklet, and connect the
+            // worklet to the context destination so the audio thread actually
+            // pulls samples through it. The destination connection is silent
+            // in Xvfb (no speakers) but it's what drives process() to run.
             const mixerOutSource = this.audioContext.createMediaStreamSource(this.destination.stream);
-            mixerOutSource.connect(scriptNode);
-            scriptNode.connect(this.audioContext.destination);
+            mixerOutSource.connect(workletNode);
+            workletNode.connect(this.audioContext.destination);
 
-            this._mixedAudioScriptNode = scriptNode;
+            this._mixedAudioWorkletNode = workletNode;
             this._mixedAudioMixerOutSource = mixerOutSource;
 
             window.ws?.sendJson({
                 type: 'MixedAudioProcessorStarted',
-                mode: 'ScriptProcessorNode',
-                bufferSize: BUFFER_SIZE,
+                mode: 'AudioWorkletNode',
+                frameSize: FRAME_SIZE,
                 sampleRate: this.audioContext.sampleRate,
             });
         } catch (error) {
