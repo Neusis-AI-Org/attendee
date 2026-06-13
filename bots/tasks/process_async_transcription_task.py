@@ -5,9 +5,10 @@ import os
 from celery import shared_task
 from django.utils import timezone
 
-from bots.models import AsyncTranscription, AsyncTranscriptionManager, AsyncTranscriptionStates, TranscriptionFailureReasons, Utterance
+from bots.models import AsyncTranscription, AsyncTranscriptionManager, AsyncTranscriptionStates, TranscriptionFailureReasons, TranscriptionProviders, Utterance
 from bots.tasks.process_utterance_group_for_async_transcription_task import process_utterance_group_for_async_transcription
 from bots.tasks.process_utterance_task import process_utterance
+from bots.transcription_utils import warm_up_whisper
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,16 @@ def create_utterances_for_transcription_using_groups(async_transcription):
     # Log all the group total durations
     for group_index, group in enumerate(groups):
         logger.info(f"Group {group_index} total duration: {sum(u.duration_ms for u in group)}ms")
+
+    # Pre-warm the Whisper Cloud Run instance before queuing the (large) group
+    # requests, so they hit a warm, model-loaded instance instead of each
+    # racing a cold start (which previously timed out the first group). Only
+    # for the OpenAI/Whisper provider; best-effort, never blocks transcription.
+    if async_transcription.transcription_provider == TranscriptionProviders.OPENAI and utterances:
+        try:
+            warm_up_whisper(recording, utterances[0].transcription_settings.openai_transcription_model())
+        except Exception as e:
+            logger.warning(f"whisper warm-up raised, proceeding anyway: {e}")
 
     # Queue each group for processing
     group_task_delay_seconds = 0

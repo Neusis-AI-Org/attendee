@@ -254,6 +254,75 @@ def get_transcription_via_assemblyai_for_utterance_group(utterances):
     return split_transcription_by_utterance(transcription, utterances), None
 
 
+def _tiny_silence_mp3(seconds: float = 0.3) -> bytes:
+    """A few hundred ms of silence as MP3 — just enough to make Whisper load
+    its model. Generated with ffmpeg's lavfi anullsrc (no input file needed)."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+        "-t", str(seconds), "-c:a", "libmp3lame", "-f", "mp3", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed building warm-up clip: {proc.stderr.decode('utf-8', 'replace')[:200]}")
+    return proc.stdout
+
+
+def warm_up_whisper(recording: Recording, model: str) -> bool:
+    """Pre-warm the Cloud Run Whisper service before the real (large) grouped
+    requests are sent. The OPENAI_BASE_URL points straight at a scale-to-zero
+    Cloud Run instance, so the first request after idle eats a container
+    cold-start + model load (~60-90s). Doing that here with a tiny silent clip
+    means the real grouped requests hit a warm, model-loaded instance and don't
+    risk the per-request timeout — without paying for min-instances=1.
+
+    Best-effort: returns True once the service answers 200, False on timeout.
+    Either way the caller proceeds (a missed warm-up just means the first real
+    request pays the cold start). Polls because while the container is spinning
+    up the endpoint may refuse connections or return 503.
+    """
+    cred_rec = recording.bot.project.credentials.filter(credential_type=Credentials.CredentialTypes.OPENAI).first()
+    if not cred_rec:
+        return False
+    creds = cred_rec.get_credentials()
+    if not creds or not creds.get("api_key"):
+        return False
+
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    url = f"{base_url}/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {creds['api_key']}"}
+    try:
+        silence = _tiny_silence_mp3()
+    except Exception as e:
+        logger.warning(f"whisper warm-up: could not build silence clip: {e}")
+        return False
+
+    total_timeout_s = int(os.getenv("WHISPER_WARMUP_TIMEOUT_SECONDS", "180"))
+    per_request_timeout_s = int(os.getenv("WHISPER_WARMUP_REQUEST_TIMEOUT_SECONDS", "150"))
+    poll_interval_s = 5
+    deadline = time.time() + total_timeout_s
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            files = {
+                "file": ("warmup.mp3", silence, "audio/mpeg"),
+                "model": (None, model),
+                "response_format": (None, "json"),
+            }
+            r = requests.post(url, headers=headers, files=files, timeout=per_request_timeout_s)
+            if r.status_code == 200:
+                logger.info(f"whisper warm-up succeeded on attempt {attempt} (model {model})")
+                return True
+            logger.info(f"whisper warm-up attempt {attempt}: status {r.status_code}")
+        except requests.RequestException as e:
+            logger.info(f"whisper warm-up attempt {attempt}: {e}")
+        time.sleep(poll_interval_s)
+
+    logger.warning(f"whisper warm-up timed out after {total_timeout_s}s; proceeding (first real request pays the cold start)")
+    return False
+
+
 def get_transcription_via_whisper_from_mp3(
     retrieve_mp3_data_callback: Callable[[], bytes],
     duration_ms: int,
@@ -291,14 +360,15 @@ def get_transcription_via_whisper_from_mp3(
     headers = {"Authorization": f"Bearer {openai_credentials['api_key']}"}
 
     mp3_data = retrieve_mp3_data_callback()
+    # NB: do NOT request `timestamp_granularities[]=word`. The faster-whisper /
+    # speaches backend returns EMPTY words AND segments when word granularity is
+    # asked for, yielding a blank transcript. Plain verbose_json returns
+    # segments (with start/end times), which is all split_transcription_by_utterance
+    # needs to map text back to each utterance by time window.
     files = {
         "file": ("file.mp3", mp3_data, "audio/mpeg"),
         "model": (None, transcription_settings.openai_transcription_model()),
         "response_format": (None, "verbose_json"),
-        # Ask for word-level times so split_transcription_by_utterance can map
-        # words back to individual utterances precisely. Backends that don't
-        # support this ignore it and we fall back to segment-level below.
-        "timestamp_granularities[]": (None, "word"),
     }
     if transcription_settings.openai_transcription_language():
         files["language"] = (None, transcription_settings.openai_transcription_language())
