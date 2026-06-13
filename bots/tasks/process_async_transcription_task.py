@@ -138,9 +138,13 @@ def check_for_transcription_completion(async_transcription):
     in_progress_utterances = async_transcription.utterances.filter(transcription__isnull=True, failure_data__isnull=True)
 
     # If no in progress utterances exist or it's been more than max_runtime_seconds, then we need to terminate the transcription
-    max_runtime_seconds = max(1800, async_transcription.utterances.count() * 3)
+    # CPU Whisper runs ~1.5-2x slower than real-time and groups process in waves
+    # bounded by Cloud Run's max-instances, so a long meeting can legitimately
+    # take well over the old 30-min floor. The 30-min cap was prematurely
+    # marking otherwise-healthy runs FAILED with utterances still in progress.
+    max_runtime_seconds = max(int(os.getenv("ASYNC_TRANSCRIPTION_MAX_RUNTIME_SECONDS", "5400")), async_transcription.utterances.count() * 3)
     if not in_progress_utterances.exists() or timezone.now() - async_transcription.started_at > timezone.timedelta(seconds=max_runtime_seconds):
-        logger.info(f"Terminating transcription for recording artifact {async_transcription.id} because no in progress utterances exist or it's been more than 30 minutes")
+        logger.info(f"Terminating transcription for recording artifact {async_transcription.id} because no in progress utterances exist or it's been more than {max_runtime_seconds}s")
         terminate_transcription(async_transcription)
         return
 

@@ -375,7 +375,12 @@ def get_transcription_via_whisper_from_mp3(
     if transcription_settings.openai_transcription_prompt():
         files["prompt"] = (None, transcription_settings.openai_transcription_prompt())
 
-    timeout_s = int(os.getenv("WHISPER_GROUP_TIMEOUT_SECONDS", "900"))
+    # faster-whisper-medium on CPU runs ~1.5-2x slower than real-time, so a
+    # 6-7 min group can take 600-920s. The old 900s cap let the largest groups
+    # time out client-side mid-transcription, triggering a Celery retry that
+    # cascaded past the async-transcription max-runtime. 1800s leaves headroom
+    # for the largest groups even on a cold (non-warmed) Cloud Run instance.
+    timeout_s = int(os.getenv("WHISPER_GROUP_TIMEOUT_SECONDS", "1800"))
     try:
         response = requests.post(url, headers=headers, files=files, timeout=timeout_s)
     except requests.RequestException as e:
