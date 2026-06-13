@@ -254,6 +254,110 @@ def get_transcription_via_assemblyai_for_utterance_group(utterances):
     return split_transcription_by_utterance(transcription, utterances), None
 
 
+def get_transcription_via_whisper_from_mp3(
+    retrieve_mp3_data_callback: Callable[[], bytes],
+    duration_ms: int,
+    identifier: str,
+    transcription_settings: TranscriptionSettings,
+    recording: Recording,
+):
+    """Transcribe one combined MP3 (a time-group of utterances) with Whisper via
+    the OpenAI-shaped endpoint. In this deployment `OPENAI_BASE_URL` points at
+    the whisper-proxy, which forwards to the Cloud Run Whisper service and
+    supplies the real auth — the `api_key` here only satisfies the proxy's
+    request shape.
+
+    Returns a dict in the same shape the splitter consumes:
+      {"transcript": str, "words": [{"word", "start"(s), "end"(s)}], "language"}.
+    Requests word-level timestamps (`verbose_json` + word granularity); if the
+    backend doesn't return words, falls back to segment-level entries so the
+    per-utterance splitter still has time-stamped text to bucket.
+    """
+    openai_credentials_record = recording.bot.project.credentials.filter(credential_type=Credentials.CredentialTypes.OPENAI).first()
+    if not openai_credentials_record:
+        return None, {"reason": TranscriptionFailureReasons.CREDENTIALS_NOT_FOUND}
+    openai_credentials = openai_credentials_record.get_credentials()
+    if not openai_credentials or not openai_credentials.get("api_key"):
+        return None, {"reason": TranscriptionFailureReasons.CREDENTIALS_NOT_FOUND}
+
+    # Very short clips are almost never real speech and can make Whisper
+    # hallucinate; skip (mirrors the AssemblyAI path's 175ms guard).
+    if duration_ms < 175:
+        logger.info(f"Whisper transcription skipped for {identifier} because it's less than 175ms in duration")
+        return {"transcript": "", "words": [], "language": None}, None
+
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    url = f"{base_url}/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {openai_credentials['api_key']}"}
+
+    mp3_data = retrieve_mp3_data_callback()
+    files = {
+        "file": ("file.mp3", mp3_data, "audio/mpeg"),
+        "model": (None, transcription_settings.openai_transcription_model()),
+        "response_format": (None, "verbose_json"),
+        # Ask for word-level times so split_transcription_by_utterance can map
+        # words back to individual utterances precisely. Backends that don't
+        # support this ignore it and we fall back to segment-level below.
+        "timestamp_granularities[]": (None, "word"),
+    }
+    if transcription_settings.openai_transcription_language():
+        files["language"] = (None, transcription_settings.openai_transcription_language())
+    if transcription_settings.openai_transcription_prompt():
+        files["prompt"] = (None, transcription_settings.openai_transcription_prompt())
+
+    timeout_s = int(os.getenv("WHISPER_GROUP_TIMEOUT_SECONDS", "900"))
+    try:
+        response = requests.post(url, headers=headers, files=files, timeout=timeout_s)
+    except requests.RequestException as e:
+        return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "error": str(e)}
+
+    if response.status_code == 401:
+        return None, {"reason": TranscriptionFailureReasons.CREDENTIALS_INVALID}
+    if response.status_code != 200:
+        logger.error(f"Whisper group transcription failed ({identifier}) status={response.status_code}: {response.text[:500]}")
+        return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "status_code": response.status_code, "text": response.text[:500]}
+
+    result = response.json()
+    language = result.get("language")
+
+    formatted_words: List[Dict[str, Any]] = []
+    words = result.get("words") or []
+    if words:
+        for w in words:
+            if w.get("start") is None or w.get("end") is None:
+                continue
+            formatted_words.append({"word": (w.get("word") or "").strip(), "start": float(w["start"]), "end": float(w["end"])})
+    else:
+        # Word timestamps unavailable — use segments as coarse "word" entries.
+        # The splitter buckets by time window, so this still attributes text to
+        # the right utterance (just at segment granularity).
+        for seg in result.get("segments") or []:
+            txt = (seg.get("text") or "").strip()
+            if not txt or seg.get("start") is None or seg.get("end") is None:
+                continue
+            formatted_words.append({"word": txt, "start": float(seg["start"]), "end": float(seg["end"])})
+
+    return {"transcript": result.get("text", ""), "words": formatted_words, "language": language}, None
+
+
+def get_transcription_via_whisper_for_utterance_group(utterances):
+    first_utterance = utterances[0]
+    total_duration_ms = sum(utterance.duration_ms for utterance in utterances)
+
+    transcription, error = get_transcription_via_whisper_from_mp3(
+        retrieve_mp3_data_callback=lambda: get_mp3_for_utterance_group(utterances, sample_rate=first_utterance.get_sample_rate()),
+        duration_ms=total_duration_ms,
+        identifier=f"utterances {[utterance.id for utterance in utterances]}",
+        transcription_settings=first_utterance.transcription_settings,
+        recording=first_utterance.recording,
+    )
+
+    if error:
+        return None, error
+
+    return split_transcription_by_utterance(transcription, utterances), None
+
+
 def get_transcription_via_assemblyai_from_mp3(
     retrieve_mp3_data_callback: Callable[[], bytes],
     duration_ms: int,

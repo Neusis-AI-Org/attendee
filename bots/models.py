@@ -2539,7 +2539,10 @@ class AsyncTranscription(models.Model):
 
     @property
     def use_grouped_utterances(self):
-        return self.transcription_provider == TranscriptionProviders.ASSEMBLY_AI
+        # Both AssemblyAI and the OpenAI-shaped Whisper provider transcribe a
+        # time-group as a single combined MP3 (see get_*_for_utterance_group),
+        # so they use the grouped path. Other providers stay per-utterance.
+        return self.transcription_provider in (TranscriptionProviders.ASSEMBLY_AI, TranscriptionProviders.OPENAI)
 
 
 class AsyncTranscriptionManager:

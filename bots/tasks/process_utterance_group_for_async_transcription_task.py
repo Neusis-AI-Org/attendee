@@ -5,7 +5,7 @@ from celery import shared_task
 logger = logging.getLogger(__name__)
 
 from bots.models import TranscriptionFailureReasons, TranscriptionProviders, Utterance
-from bots.transcription_utils import get_transcription_via_assemblyai_for_utterance_group, is_retryable_failure
+from bots.transcription_utils import get_transcription_via_assemblyai_for_utterance_group, get_transcription_via_whisper_for_utterance_group, is_retryable_failure
 
 
 def get_transcription(utterances):
@@ -14,6 +14,12 @@ def get_transcription(utterances):
         transcription_provider = utterances[0].transcription_provider
         if transcription_provider == TranscriptionProviders.ASSEMBLY_AI:
             transcriptions, failure_data = get_transcription_via_assemblyai_for_utterance_group(utterances)
+        elif transcription_provider == TranscriptionProviders.OPENAI:
+            # OpenAI-shaped provider = Whisper via the proxy → Cloud Run in this
+            # deployment. Time-grouped batch (one MP3 per ~10-min group) instead
+            # of per-utterance, to avoid the 429 burst and short-clip
+            # hallucination of the sync path.
+            transcriptions, failure_data = get_transcription_via_whisper_for_utterance_group(utterances)
         else:
             raise Exception(f"Unknown or unsupported transcription provider: {transcription_provider}")
 
