@@ -331,16 +331,16 @@ def get_transcription_via_whisper_from_mp3(
     recording: Recording,
 ):
     """Transcribe one combined MP3 (a time-group of utterances) with Whisper via
-    the OpenAI-shaped endpoint. In this deployment `OPENAI_BASE_URL` points at
-    the whisper-proxy, which forwards to the Cloud Run Whisper service and
-    supplies the real auth — the `api_key` here only satisfies the proxy's
-    request shape.
+    the OpenAI-shaped endpoint. In this deployment `OPENAI_BASE_URL` points
+    straight at the Cloud Run faster-whisper service (no rewriting proxy), so the
+    `model` field is used verbatim and must be the real loaded model id.
 
     Returns a dict in the same shape the splitter consumes:
       {"transcript": str, "words": [{"word", "start"(s), "end"(s)}], "language"}.
-    Requests word-level timestamps (`verbose_json` + word granularity); if the
-    backend doesn't return words, falls back to segment-level entries so the
-    per-utterance splitter still has time-stamped text to bucket.
+    Uses plain `verbose_json` (segments with start/end times); when the backend
+    surfaces a top-level words array those are used, otherwise each segment
+    becomes one coarse "word" entry so the per-utterance splitter still has
+    time-stamped text to bucket.
     """
     openai_credentials_record = recording.bot.project.credentials.filter(credential_type=Credentials.CredentialTypes.OPENAI).first()
     if not openai_credentials_record:
