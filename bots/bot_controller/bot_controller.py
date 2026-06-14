@@ -600,14 +600,22 @@ class BotController:
         mp4_path = self.get_recording_file_location()
         content_type = self.bot_in_db.recording_upload_content_type()
 
-        # When the caller asked for audio/mpeg (the default), strip the video
-        # track and re-encode to MP3 before uploading. The recording is captured
-        # as MP4 (screen + audio) for in-meeting fidelity, but the long-term
-        # GCS artifact is audio-only — ~70% smaller, sufficient for downstream
-        # transcription / human listen-back.
+        # When the caller asked for audio/mpeg (the default), the long-term GCS
+        # artifact should be audio-only MP3 (~70% smaller, sufficient for
+        # downstream transcription / human listen-back). Two capture shapes
+        # reach here:
+        #   - format=mp3 recordings are ALREADY audio-only MP3 -> upload as-is.
+        #   - legacy MP4 (screen+audio) recordings -> strip video, re-encode.
+        # CRITICAL: never transcode in place. For an mp3 recording
+        # get_recording_file_location() already ends in `.mp3`, so deriving the
+        # output by swapping the extension to `.mp3` yields the SAME path —
+        # `ffmpeg -y` then truncates its own input to 0 bytes and the upload
+        # ships an empty file (this was the root cause of 0-byte GCS recordings
+        # after the recording_settings format=mp3 switch). Skipping the
+        # transcode when the source is already mp3 guarantees input != output.
         upload_path = mp4_path
         cleanup_path: str | None = None
-        if content_type.startswith("audio/"):
+        if content_type.startswith("audio/") and not mp4_path.lower().endswith(".mp3"):
             mp3_path = mp4_path.rsplit(".", 1)[0] + ".mp3"
             try:
                 import subprocess
