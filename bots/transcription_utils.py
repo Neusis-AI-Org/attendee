@@ -360,15 +360,36 @@ def get_transcription_via_whisper_from_mp3(
     headers = {"Authorization": f"Bearer {openai_credentials['api_key']}"}
 
     mp3_data = retrieve_mp3_data_callback()
-    # NB: do NOT request `timestamp_granularities[]=word`. The faster-whisper /
-    # speaches backend returns EMPTY words AND segments when word granularity is
-    # asked for, yielding a blank transcript. Plain verbose_json returns
-    # segments (with start/end times), which is all split_transcription_by_utterance
-    # needs to map text back to each utterance by time window.
+    # Request WORD-level timestamps. split_transcription_by_utterance maps text
+    # back to each utterance by time window; with only segment-level granularity
+    # a single 2-10s Whisper segment that spans several short (~5s) utterance
+    # windows gets dumped entirely into the first window, leaving the others
+    # blank (observed: 137/323 utterances empty even though every chunk
+    # transcribes cleanly on its own). Word-level timestamps let each word land
+    # in its own window, so attribution is even and per-utterance/diarization is
+    # correct. NB: word granularity used to return EMPTY words+segments on this
+    # speaches backend, which is why it was previously disabled — that was the
+    # repetition/temperature bug fixed by the anti-hallucination image patch
+    # (temperature fallback + condition_on_previous_text=False). The parser
+    # still falls back to segment-level entries if `words` ever comes back empty.
     files = {
         "file": ("file.mp3", mp3_data, "audio/mpeg"),
         "model": (None, transcription_settings.openai_transcription_model()),
         "response_format": (None, "verbose_json"),
+        "timestamp_granularities[]": (None, "word"),
+        # MUST disable VAD for the grouped path. get_mp3_for_utterance_group
+        # concatenates utterances with `silence_seconds` of silence between
+        # them, and split_transcription_by_utterance rebuilds per-utterance
+        # windows ASSUMING those gaps are present. speaches defaults
+        # vad_filter=True, which strips the silences before transcribing and
+        # collapses the returned word/segment timestamps — so over many
+        # utterances the window timeline drifts (322 gaps x 3s ~= 16 min on a
+        # 323-utterance meeting) and most short utterances get assigned no
+        # words. With VAD off the timeline is preserved and the split aligns;
+        # the anti-hallucination patch on the Whisper image (temperature
+        # fallback + no_repeat_ngram + condition_on_previous_text=False) covers
+        # any silence-induced looping that VAD would otherwise have removed.
+        "vad_filter": (None, "false"),
     }
     if transcription_settings.openai_transcription_language():
         files["language"] = (None, transcription_settings.openai_transcription_language())
