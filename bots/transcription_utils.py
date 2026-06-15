@@ -219,15 +219,18 @@ def split_transcription_by_utterance(
                 break
             # If word ends after window start, it overlaps
             if w["end"] > start:
-                # Check that word doesn't also overlap with next window (unexpected)
+                word_adjusted = dict(w)
+                word_adjusted["start"] = word_adjusted["start"] - start
+                # Clamp end to the current window boundary when the word spills
+                # into the silence gap or the next utterance (rare with word-level
+                # timestamps but happens with slow speech or imprecise Whisper
+                # timing). Clamping keeps the word instead of silently dropping it.
                 if next_start is not None and w["end"] > next_start:
-                    logger.warning(f"Word overlaps with subsequent window, skipping: {w}")
+                    logger.warning(f"Word overlaps with subsequent window, clamping end: {w}")
+                    word_adjusted["end"] = end - start
                 else:
-                    # Create a new word object with the start and end times adjusted to the current window
-                    word_adjusted = dict(w)
-                    word_adjusted["start"] = word_adjusted["start"] - start
                     word_adjusted["end"] = word_adjusted["end"] - start
-                    utterance_words.append(word_adjusted)
+                utterance_words.append(word_adjusted)
             word_index += 1
 
         output[utterance_id]["words"] = utterance_words

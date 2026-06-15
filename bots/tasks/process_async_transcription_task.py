@@ -70,7 +70,11 @@ def create_utterances_for_transcription_using_groups(async_transcription):
     # Group utterances into evenly-sized groups based on total duration
     # Calculate number of groups needed, then divide duration evenly.
     # This avoids creating tiny groups.
-    max_group_duration_ms = int(os.getenv("ASYNC_TRANSCRIPTION_MAX_UTTERANCE_GROUP_DURATION_MS", 30 * 60 * 1000))  # 30 minutes in milliseconds
+    # 5 min default. CPU Whisper runs ~1.5-2x slower than real-time, so a
+    # 5-min group takes ~7.5 min (450s) — well within WHISPER_GROUP_TIMEOUT_SECONDS=1800.
+    # The old 30-min default produced groups that took 45-60 min, reliably
+    # exceeding the 1800s client timeout on every group.
+    max_group_duration_ms = int(os.getenv("ASYNC_TRANSCRIPTION_MAX_UTTERANCE_GROUP_DURATION_MS", 5 * 60 * 1000))  # 5 minutes in milliseconds
     total_duration_ms = sum(u.duration_ms for u in utterances)
     if total_duration_ms == 0:
         total_duration_ms = 1

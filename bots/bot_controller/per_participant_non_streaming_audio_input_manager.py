@@ -24,7 +24,13 @@ logger = logging.getLogger(__name__)
 #   0.010   upstream default (Zoom-only deployments)
 #   0.003   Teams + Zoom mix (still gates obvious silence)
 #   0.001   Teams-only / aggressive (lets more noise through to VAD)
-RMS_SILENCE_THRESHOLD = float(os.environ.get("RMS_SILENCE_THRESHOLD", "0.01"))
+# Default lowered to 0.003 (Teams + Zoom mix). The original 0.01 was
+# calibrated for Zoom-only, where per-participant levels are louder; on
+# Teams it caused ~70% of real speech to be discarded as silence, leading
+# to empty utterances and missed transcription across the whole meeting.
+# Set RMS_SILENCE_THRESHOLD=0.001 if you need even more aggressive retention
+# on a Teams-only deployment.
+RMS_SILENCE_THRESHOLD = float(os.environ.get("RMS_SILENCE_THRESHOLD", "0.003"))
 
 
 def calculate_normalized_rms(audio_bytes):
